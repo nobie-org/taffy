@@ -129,5 +129,13 @@ pub use parse::{ParseError, ParseResult};
 pub use crate::compute::*;
 pub use crate::geometry::*;
 pub use crate::style::*;
-pub use crate::tree::*;
+pub use crate::tree::traits;
+#[cfg(feature = "detailed_layout_info")]
+pub use crate::tree::DetailedLayoutInfo;
+pub use crate::tree::{
+    Cache, ClearState, CollapsibleMarginSet, Layout, LayoutInput, LayoutOutput, NodeId, RequestedAxis, RunMode,
+    SizingMode,
+};
+#[cfg(feature = "taffy_tree")]
+pub use crate::tree::{TaffyError, TaffyResult};
 pub use crate::util::*;

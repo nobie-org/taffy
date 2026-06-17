@@ -1,4 +1,5 @@
 //! Contains [TaffyTree](crate::tree::TaffyTree): the default implementation of [LayoutTree](crate::tree::LayoutTree), and the error type for Taffy.
+use core::cell::RefCell;
 #[cfg(not(feature = "std"))]
 use slotmap::SecondaryMap;
 #[cfg(feature = "std")]
@@ -11,8 +12,8 @@ use crate::geometry::Size;
 use crate::style::{AvailableSpace, Display, Style};
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
-    Cache, ClearState, Layout, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode,
-    TraversePartialTree, TraverseTree,
+    Cache, ClearState, Layout, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEvent, LayoutInput, LayoutOutput,
+    LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode, TraversePartialTree, TraverseTree,
 };
 use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
@@ -262,21 +263,25 @@ impl<NodeContext> PrintTree for TaffyTree<NodeContext> {
 /// View over the Taffy tree that holds the tree itself along with a reference to the context
 /// and implements LayoutTree. This allows the context to be stored outside of the TaffyTree struct
 /// which makes the lifetimes of the context much more flexible.
-pub(crate) struct TaffyView<'t, NodeContext, MeasureFunction>
+pub(crate) struct TaffyView<'t, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     /// A reference to the TaffyTree
     pub(crate) taffy: &'t mut TaffyTree<NodeContext>,
     /// The context provided for passing to measure functions if layout is run over this struct
     pub(crate) measure_function: MeasureFunction,
+    /// Passive cache-event observer for retained layout integrations.
+    pub(crate) cache_event_function: RefCell<CacheEventFunction>,
 }
 
-impl<NodeContext, MeasureFunction> TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     #[inline(always)]
     /// Unified implementation that both `LayoutPartialTree::compute_child_layout`
@@ -331,10 +336,12 @@ where
 }
 
 // TraversePartialTree impl for TaffyView
-impl<NodeContext, MeasureFunction> TraversePartialTree for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> TraversePartialTree
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     type ChildIter<'a>
         = TaffyTreeChildIter<'a>
@@ -358,17 +365,22 @@ where
 }
 
 // TraverseTree impl for TaffyView
-impl<NodeContext, MeasureFunction> TraverseTree for TaffyView<'_, NodeContext, MeasureFunction> where
+impl<NodeContext, MeasureFunction, CacheEventFunction> TraverseTree
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
+where
     MeasureFunction:
-        FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>
+        FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
 }
 
 // LayoutPartialTree impl for TaffyView
-impl<NodeContext, MeasureFunction> LayoutPartialTree for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> LayoutPartialTree
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     type CoreContainerStyle<'a>
         = &'a Style
@@ -403,29 +415,45 @@ where
     }
 }
 
-impl<NodeContext, MeasureFunction> CacheTree for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> CacheTree
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
-        self.taffy.nodes[node_id.into()].cache.get(input)
+        let (entry_id, output) = self.taffy.nodes[node_id.into()].cache.get_with_entry(input)?;
+        (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Hit(LayoutCacheEntry::new(
+            node_id, entry_id, *input, output,
+        )));
+        Some(output)
     }
 
     fn cache_store(&mut self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput) {
-        self.taffy.nodes[node_id.into()].cache.store(input, layout_output)
+        if let Some(entry_id) = self.taffy.nodes[node_id.into()].cache.store_with_entry(input, layout_output) {
+            (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Stored(LayoutCacheEntry::new(
+                node_id,
+                entry_id,
+                *input,
+                layout_output,
+            )));
+        }
     }
 
     fn cache_clear(&mut self, node_id: NodeId) {
         self.taffy.nodes[node_id.into()].cache.clear();
+        (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Cleared(LayoutCacheClear::new(node_id)));
     }
 }
 
 #[cfg(feature = "block_layout")]
-impl<NodeContext, MeasureFunction> LayoutBlockContainer for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> LayoutBlockContainer
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     type BlockContainerStyle<'a>
         = &'a Style
@@ -458,10 +486,12 @@ where
 }
 
 #[cfg(feature = "flexbox")]
-impl<NodeContext, MeasureFunction> LayoutFlexboxContainer for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> LayoutFlexboxContainer
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     type FlexboxContainerStyle<'a>
         = &'a Style
@@ -484,10 +514,12 @@ where
 }
 
 #[cfg(feature = "grid")]
-impl<NodeContext, MeasureFunction> LayoutGridContainer for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> LayoutGridContainer
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     type GridContainerStyle<'a>
         = &'a Style
@@ -516,10 +548,12 @@ where
 }
 
 // RoundTree impl for TaffyView
-impl<NodeContext, MeasureFunction> RoundTree for TaffyView<'_, NodeContext, MeasureFunction>
+impl<NodeContext, MeasureFunction, CacheEventFunction> RoundTree
+    for TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
 where
     MeasureFunction:
         FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     #[inline(always)]
     fn get_unrounded_layout(&self, node: NodeId) -> Layout {
@@ -912,8 +946,26 @@ impl<NodeContext> TaffyTree<NodeContext> {
         MeasureFunction:
             FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
     {
+        self.compute_layout_with_measure_and_cache_events(node_id, available_space, measure_function, |_| {})
+    }
+
+    /// Updates the stored layout of the provided `node` and its children,
+    /// emitting passive observations of layout-cache hits, stores, and clears.
+    pub fn compute_layout_with_measure_and_cache_events<MeasureFunction, CacheEventFunction>(
+        &mut self,
+        node_id: NodeId,
+        available_space: Size<AvailableSpace>,
+        measure_function: MeasureFunction,
+        cache_event_function: CacheEventFunction,
+    ) -> Result<(), TaffyError>
+    where
+        MeasureFunction:
+            FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+        CacheEventFunction: FnMut(LayoutCacheEvent),
+    {
         let use_rounding = self.config.use_rounding;
-        let mut taffy_view = TaffyView { taffy: self, measure_function };
+        let mut taffy_view =
+            TaffyView { taffy: self, measure_function, cache_event_function: RefCell::new(cache_event_function) };
         compute_root_layout(&mut taffy_view, node_id, available_space);
         if use_rounding {
             round_layout(&mut taffy_view, node_id);
@@ -935,7 +987,11 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// Returns an instance of LayoutTree representing the TaffyTree
     #[cfg(test)]
     pub(crate) fn as_layout_tree(&mut self) -> impl LayoutPartialTree + CacheTree + '_ {
-        TaffyView { taffy: self, measure_function: |_, _, _, _, _| Size::ZERO }
+        TaffyView {
+            taffy: self,
+            measure_function: |_, _, _, _, _| Size::ZERO,
+            cache_event_function: RefCell::new(|_| {}),
+        }
     }
 }
 
@@ -955,6 +1011,88 @@ mod tests {
         _style: &Style,
     ) -> Size<f32> {
         known_dimensions.unwrap_or(node_context.cloned().unwrap_or(Size::ZERO))
+    }
+
+    #[test]
+    fn cache_events_report_store_then_hit_for_same_entry() {
+        let mut taffy: TaffyTree<Size<f32>> = TaffyTree::new();
+        let node = taffy.new_leaf_with_context(Style::default(), Size { width: 100.0, height: 20.0 }).unwrap();
+        let mut events = sys::Vec::new();
+
+        taffy
+            .compute_layout_with_measure_and_cache_events(node, Size::MAX_CONTENT, size_measure_function, |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        let stored_entry_id = match events.as_slice() {
+            [LayoutCacheEvent::Stored(entry)] => {
+                assert_eq!(entry.node_id(), node);
+                assert_eq!(entry.requested_input().run_mode, RunMode::PerformLayout);
+                assert_eq!(entry.returned_output().size, Size { width: 100.0, height: 20.0 });
+                entry.entry_id()
+            }
+            events => panic!("expected one store event, got {events:?}"),
+        };
+
+        events.clear();
+        taffy
+            .compute_layout_with_measure_and_cache_events(node, Size::MAX_CONTENT, size_measure_function, |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        match events.as_slice() {
+            [LayoutCacheEvent::Hit(entry)] => {
+                assert_eq!(entry.node_id(), node);
+                assert_eq!(entry.entry_id(), stored_entry_id);
+                assert_eq!(entry.requested_input().run_mode, RunMode::PerformLayout);
+                assert_eq!(entry.returned_output().size, Size { width: 100.0, height: 20.0 });
+            }
+            events => panic!("expected one hit event, got {events:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_event_observer_does_not_change_layout() {
+        let mut without_events: TaffyTree<Size<f32>> = TaffyTree::new();
+        let plain_node =
+            without_events.new_leaf_with_context(Style::default(), Size { width: 120.0, height: 30.0 }).unwrap();
+        without_events.compute_layout_with_measure(plain_node, Size::MAX_CONTENT, size_measure_function).unwrap();
+
+        let mut with_events: TaffyTree<Size<f32>> = TaffyTree::new();
+        let observed_node =
+            with_events.new_leaf_with_context(Style::default(), Size { width: 120.0, height: 30.0 }).unwrap();
+        with_events
+            .compute_layout_with_measure_and_cache_events(
+                observed_node,
+                Size::MAX_CONTENT,
+                size_measure_function,
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(with_events.layout(observed_node).unwrap(), without_events.layout(plain_node).unwrap());
+    }
+
+    #[test]
+    fn cache_events_report_compute_time_clear() {
+        let mut taffy: TaffyTree<Size<f32>> = TaffyTree::new();
+        let node = taffy.new_leaf_with_context(Style::default(), Size { width: 100.0, height: 20.0 }).unwrap();
+        taffy.compute_layout_with_measure(node, Size::MAX_CONTENT, size_measure_function).unwrap();
+        taffy.set_style(node, Style { display: Display::None, ..Style::default() }).unwrap();
+
+        let mut events = sys::Vec::new();
+        taffy
+            .compute_layout_with_measure_and_cache_events(node, Size::MAX_CONTENT, size_measure_function, |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        assert!(
+            events.iter().any(|event| matches!(event, LayoutCacheEvent::Cleared(clear) if clear.node_id() == node)),
+            "expected clear event, got {events:?}",
+        );
     }
 
     #[test]
