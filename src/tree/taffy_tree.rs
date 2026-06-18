@@ -8,14 +8,15 @@ use slotmap::{DefaultKey, SlotMap};
 
 #[cfg(feature = "block_layout")]
 use crate::block::BlockContext;
-use crate::geometry::{Rect, Size};
+use crate::geometry::{Line, Rect, Size};
 use crate::style::{AvailableSpace, CompactLength, Dimension, Display, LengthPercentage, LengthPercentageAuto, Style};
 #[cfg(feature = "grid")]
 use crate::style::{GridTemplateComponent, TrackSizingFunction};
+use crate::style_helpers::TaffyAuto as _;
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
     Cache, ClearState, Layout, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEvent, LayoutInput, LayoutOutput,
-    LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode, TraversePartialTree, TraverseTree,
+    LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode, SizingMode, TraversePartialTree, TraverseTree,
 };
 use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
@@ -238,11 +239,42 @@ fn style_depends_on_parent_size(style: &Style) -> bool {
 }
 
 #[inline]
-fn cache_input_for_style(input: &LayoutInput, style: &Style) -> LayoutInput {
+fn dimension_affects_sizing_mode(dimension: Dimension) -> bool {
+    dimension != Dimension::AUTO
+}
+
+#[inline]
+fn style_depends_on_sizing_mode(style: &Style) -> bool {
+    size_depends_on_parent_size(style.size, dimension_affects_sizing_mode)
+        || size_depends_on_parent_size(style.min_size, dimension_affects_sizing_mode)
+        || size_depends_on_parent_size(style.max_size, dimension_affects_sizing_mode)
+        || style.aspect_ratio.is_some()
+}
+
+#[inline]
+fn cache_input_for_node(style: &Style, has_children: bool, input: &LayoutInput) -> LayoutInput {
     let mut cache_input = *input;
-    if !style_depends_on_parent_size(style) {
+
+    if !has_children && !style_depends_on_parent_size(style) {
         cache_input.parent_size = Size::NONE;
     }
+
+    if !style_depends_on_sizing_mode(style) {
+        cache_input.sizing_mode = SizingMode::InherentSize;
+    }
+
+    #[cfg(feature = "block_layout")]
+    {
+        if !(has_children && style.display == Display::Block) {
+            cache_input.vertical_margins_are_collapsible = Line::FALSE;
+        }
+    }
+
+    #[cfg(not(feature = "block_layout"))]
+    {
+        cache_input.vertical_margins_are_collapsible = Line::FALSE;
+    }
+
     cache_input
 }
 
@@ -318,13 +350,16 @@ impl<NodeContext> TraverseTree for TaffyTree<NodeContext> {}
 impl<NodeContext> CacheTree for TaffyTree<NodeContext> {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
         let node = &self.nodes[node_id.into()];
-        let cache_input = cache_input_for_style(input, &node.style);
+        let cache_input = cache_input_for_node(&node.style, !self.children[node_id.into()].is_empty(), input);
         node.cache.get(&cache_input)
     }
 
     fn cache_store(&mut self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput) {
+        let cache_input = {
+            let node = &self.nodes[node_id.into()];
+            cache_input_for_node(&node.style, !self.children[node_id.into()].is_empty(), input)
+        };
         let node = &mut self.nodes[node_id.into()];
-        let cache_input = cache_input_for_style(input, &node.style);
         node.cache.store(&cache_input, layout_output)
     }
 
@@ -533,7 +568,7 @@ where
 {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
         let node = &self.taffy.nodes[node_id.into()];
-        let cache_input = cache_input_for_style(input, &node.style);
+        let cache_input = cache_input_for_node(&node.style, !self.taffy.children[node_id.into()].is_empty(), input);
         let (entry_id, output) = node.cache.get_with_entry(&cache_input)?;
         (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Hit(LayoutCacheEntry::new(
             node_id, entry_id, *input, output,
@@ -542,8 +577,11 @@ where
     }
 
     fn cache_store(&mut self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput) {
+        let cache_input = {
+            let node = &self.taffy.nodes[node_id.into()];
+            cache_input_for_node(&node.style, !self.taffy.children[node_id.into()].is_empty(), input)
+        };
         let node = &mut self.taffy.nodes[node_id.into()];
-        let cache_input = cache_input_for_style(input, &node.style);
         if let Some(entry_id) = node.cache.store_with_entry(&cache_input, layout_output) {
             (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Stored(LayoutCacheEntry::new(
                 node_id,
@@ -1112,11 +1150,12 @@ impl<NodeContext> TaffyTree<NodeContext> {
 mod tests {
 
     use super::*;
-    use crate::geometry::Line;
+    use crate::geometry::{Line, Rect};
     use crate::style::{Dimension, Display, FlexDirection};
     use crate::style_helpers::*;
     use crate::tree::{RequestedAxis, SizingMode};
     use crate::util::sys;
+    use core::cell::RefCell;
 
     fn size_measure_function(
         known_dimensions: Size<Option<f32>>,
@@ -1211,11 +1250,59 @@ mod tests {
     }
 
     #[test]
+    fn cache_events_report_raw_requested_input_not_normalized_key() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let node = taffy
+            .new_leaf(Style {
+                size: Size { width: Dimension::from_length(100.0_f32), height: Dimension::from_length(100.0_f32) },
+                ..Style::default()
+            })
+            .unwrap();
+        let input = |parent_width| LayoutInput {
+            run_mode: RunMode::ComputeSize,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: Size::NONE,
+            parent_size: Size { width: Some(parent_width), height: Some(100.0) },
+            available_space: Size::MAX_CONTENT,
+            vertical_margins_are_collapsible: Line::FALSE,
+        };
+
+        let mut events = sys::Vec::new();
+        {
+            let mut tree = TaffyView {
+                taffy: &mut taffy,
+                measure_function: |_, _, _, _, _| Size::ZERO,
+                cache_event_function: RefCell::new(|event| events.push(event)),
+            };
+            LayoutPartialTree::compute_child_layout(&mut tree, node, input(100.0));
+        }
+        events.clear();
+
+        {
+            let mut tree = TaffyView {
+                taffy: &mut taffy,
+                measure_function: |_, _, _, _, _| Size::ZERO,
+                cache_event_function: RefCell::new(|event| events.push(event)),
+            };
+            LayoutPartialTree::compute_child_layout(&mut tree, node, input(200.0));
+        }
+
+        match events.as_slice() {
+            [LayoutCacheEvent::Hit(entry)] => {
+                assert_eq!(entry.requested_input().parent_size.width, Some(200.0));
+                assert_eq!(entry.returned_output().size, Size { width: 100.0, height: 100.0 });
+            }
+            events => panic!("expected one hit event, got {events:?}"),
+        }
+    }
+
+    #[test]
     fn percent_sized_leaf_cache_observes_parent_size() {
         let mut taffy: TaffyTree<()> = TaffyTree::new();
         let node = taffy
             .new_leaf(Style {
-                size: Size { width: Dimension::from_percent(1.0), height: Dimension::from_percent(1.0) },
+                size: Size { width: Dimension::from_percent(1.0_f32), height: Dimension::from_percent(1.0_f32) },
                 ..Style::default()
             })
             .unwrap();
@@ -1244,11 +1331,81 @@ mod tests {
     }
 
     #[test]
-    fn non_percent_leaf_cache_ignores_parent_size() {
+    fn percent_sized_leaf_cache_observes_sizing_mode() {
         let mut taffy: TaffyTree<()> = TaffyTree::new();
         let node = taffy
             .new_leaf(Style {
-                size: Size { width: Dimension::from_length(100.0), height: Dimension::from_length(100.0) },
+                size: Size { width: Dimension::from_percent(1.0_f32), height: Dimension::from_percent(1.0_f32) },
+                ..Style::default()
+            })
+            .unwrap();
+
+        let input = |sizing_mode| LayoutInput {
+            run_mode: RunMode::ComputeSize,
+            sizing_mode,
+            axis: RequestedAxis::Both,
+            known_dimensions: Size::NONE,
+            parent_size: Size { width: Some(100.0), height: Some(200.0) },
+            available_space: Size::MAX_CONTENT,
+            vertical_margins_are_collapsible: Line::FALSE,
+        };
+
+        let first = {
+            let mut tree = taffy.as_layout_tree();
+            tree.compute_child_layout(node, input(SizingMode::ContentSize))
+        };
+        assert_eq!(first.size, Size::ZERO);
+
+        let second = {
+            let mut tree = taffy.as_layout_tree();
+            tree.compute_child_layout(node, input(SizingMode::InherentSize))
+        };
+        assert_eq!(second.size, Size { width: 100.0, height: 200.0 });
+    }
+
+    #[test]
+    fn block_cache_observes_vertical_margin_collapse_context() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy
+            .new_leaf(Style {
+                display: Display::Block,
+                margin: Rect { top: length(20.0_f32), bottom: length(30.0_f32), ..Rect::zero() },
+                ..Style::default()
+            })
+            .unwrap();
+        let node = taffy.new_with_children(Style { display: Display::Block, ..Style::default() }, &[child]).unwrap();
+
+        let input = |vertical_margins_are_collapsible| LayoutInput {
+            run_mode: RunMode::PerformLayout,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: Size { width: Some(100.0), height: None },
+            parent_size: Size { width: Some(100.0), height: None },
+            available_space: Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::MaxContent },
+            vertical_margins_are_collapsible,
+        };
+
+        let collapsed = {
+            let mut tree = taffy.as_layout_tree();
+            tree.compute_child_layout(node, input(Line::TRUE))
+        };
+        assert_eq!(collapsed.top_margin.resolve(), 30.0);
+        assert_eq!(collapsed.bottom_margin.resolve(), 30.0);
+
+        let not_collapsed = {
+            let mut tree = taffy.as_layout_tree();
+            tree.compute_child_layout(node, input(Line::FALSE))
+        };
+        assert_eq!(not_collapsed.top_margin.resolve(), 0.0);
+        assert_eq!(not_collapsed.bottom_margin.resolve(), 0.0);
+    }
+
+    #[test]
+    fn non_percent_leaf_size_is_stable_when_parent_size_changes() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let node = taffy
+            .new_leaf(Style {
+                size: Size { width: Dimension::from_length(100.0_f32), height: Dimension::from_length(100.0_f32) },
                 ..Style::default()
             })
             .unwrap();
