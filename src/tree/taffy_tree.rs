@@ -278,6 +278,14 @@ fn cache_input_for_node(style: &Style, has_children: bool, input: &LayoutInput) 
     cache_input
 }
 
+#[inline]
+fn can_reuse_cache_entry(has_children: bool, input: &LayoutInput) -> bool {
+    // A container PerformLayout result stores this node's output only; it does
+    // not replay the descendant final-layout writes that make layout(node)
+    // observable after a root compute.
+    !(has_children && input.run_mode == RunMode::PerformLayout)
+}
+
 /// An entire tree of UI nodes. The entry point to Taffy's high-level API.
 ///
 /// Allows you to build a tree of UI nodes, run Taffy's layout algorithms over that tree, and then access the resultant layout.]
@@ -350,7 +358,11 @@ impl<NodeContext> TraverseTree for TaffyTree<NodeContext> {}
 impl<NodeContext> CacheTree for TaffyTree<NodeContext> {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
         let node = &self.nodes[node_id.into()];
-        let cache_input = cache_input_for_node(&node.style, !self.children[node_id.into()].is_empty(), input);
+        let has_children = !self.children[node_id.into()].is_empty();
+        if !can_reuse_cache_entry(has_children, input) {
+            return None;
+        }
+        let cache_input = cache_input_for_node(&node.style, has_children, input);
         node.cache.get(&cache_input)
     }
 
@@ -568,7 +580,11 @@ where
 {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
         let node = &self.taffy.nodes[node_id.into()];
-        let cache_input = cache_input_for_node(&node.style, !self.taffy.children[node_id.into()].is_empty(), input);
+        let has_children = !self.taffy.children[node_id.into()].is_empty();
+        if !can_reuse_cache_entry(has_children, input) {
+            return None;
+        }
+        let cache_input = cache_input_for_node(&node.style, has_children, input);
         let (entry_id, output) = node.cache.get_with_entry(&cache_input)?;
         (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Hit(LayoutCacheEntry::new(
             node_id, entry_id, *input, output,
@@ -1227,6 +1243,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(with_events.layout(observed_node).unwrap(), without_events.layout(plain_node).unwrap());
+    }
+
+    #[test]
+    fn container_final_cache_cannot_skip_observable_descendant_layouts() {
+        let full_size = Style {
+            size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+            ..Style::default()
+        };
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(full_size.clone()).unwrap();
+        let parent = taffy.new_with_children(full_size.clone(), &[child]).unwrap();
+        let root = taffy.new_with_children(full_size, &[parent]).unwrap();
+
+        taffy
+            .compute_layout(
+                root,
+                Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::Definite(100.0) },
+            )
+            .unwrap();
+        assert_eq!(taffy.layout(child).unwrap().size, Size { width: 100.0, height: 100.0 });
+
+        taffy
+            .compute_layout(child, Size { width: AvailableSpace::Definite(0.0), height: AvailableSpace::Definite(0.0) })
+            .unwrap();
+        assert_eq!(taffy.layout(child).unwrap().size, Size { width: 0.0, height: 0.0 });
+
+        taffy
+            .compute_layout(
+                root,
+                Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::Definite(100.0) },
+            )
+            .unwrap();
+
+        assert_eq!(taffy.layout(root).unwrap().size, Size { width: 100.0, height: 100.0 });
+        assert_eq!(taffy.layout(parent).unwrap().size, Size { width: 100.0, height: 100.0 });
+        assert_eq!(taffy.layout(child).unwrap().size, Size { width: 100.0, height: 100.0 });
     }
 
     #[test]
