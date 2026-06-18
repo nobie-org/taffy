@@ -134,6 +134,8 @@ pub(crate) struct CacheEntry<T> {
     parent_size: Size<Option<f32>>,
     /// The initial cached available space
     available_space: Size<AvailableSpace>,
+    /// Generation witness for descendant layout slots when this entry was stored.
+    descendant_layout_generation: u64,
     /// Whether style sizes were included in this cached computation.
     sizing_mode: SizingMode,
     /// Whether block layout margins could collapse through this cached computation.
@@ -258,12 +260,16 @@ impl Cache {
     /// Try to retrieve a cached result from the cache
     #[inline]
     pub fn get(&self, input: &LayoutInput) -> Option<LayoutOutput> {
-        self.get_with_entry(input).map(|(_, output)| output)
+        self.get_with_entry(input, 0).map(|(_, output)| output)
     }
 
     /// Try to retrieve a cached result and the entry that matched it.
     #[inline]
-    pub(crate) fn get_with_entry(&self, input: &LayoutInput) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
+    pub(crate) fn get_with_entry(
+        &self,
+        input: &LayoutInput,
+        descendant_layout_generation: u64,
+    ) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
         let known_dimensions = input.known_dimensions;
         let available_space = input.available_space;
 
@@ -273,6 +279,7 @@ impl Cache {
                 .filter(|entry| {
                     let cached_size = entry.content.size;
                     Self::layout_context_matches(entry, input)
+                        && entry.descendant_layout_generation == descendant_layout_generation
                         && (known_dimensions.width == entry.known_dimensions.width
                             || known_dimensions.width == Some(cached_size.width))
                         && (known_dimensions.height == entry.known_dimensions.height
@@ -314,7 +321,7 @@ impl Cache {
 
     /// Store a computed size in the cache
     pub fn store(&mut self, input: &LayoutInput, layout_output: LayoutOutput) {
-        self.store_with_entry(input, layout_output);
+        self.store_with_entry(input, layout_output, 0);
     }
 
     /// Store a computed size in the cache and return the entry that was written.
@@ -322,6 +329,7 @@ impl Cache {
         &mut self,
         input: &LayoutInput,
         layout_output: LayoutOutput,
+        descendant_layout_generation: u64,
     ) -> Option<LayoutCacheEntryId> {
         let known_dimensions = input.known_dimensions;
         let parent_size = input.parent_size;
@@ -336,6 +344,7 @@ impl Cache {
                     known_dimensions,
                     parent_size,
                     available_space,
+                    descendant_layout_generation,
                     sizing_mode,
                     vertical_margins_are_collapsible,
                     content: layout_output,
@@ -349,6 +358,7 @@ impl Cache {
                     known_dimensions,
                     parent_size,
                     available_space,
+                    descendant_layout_generation: 0,
                     sizing_mode,
                     vertical_margins_are_collapsible,
                     content: layout_output.size,
@@ -417,13 +427,13 @@ mod tests {
         let mut cache = Cache::new();
         let stored_input = compute_size_input(Size::NONE, Size::MAX_CONTENT);
         let stored_output = LayoutOutput::from_outer_size(Size { width: 100.0, height: 20.0 });
-        let stored_entry_id = cache.store_with_entry(&stored_input, stored_output).unwrap();
+        let stored_entry_id = cache.store_with_entry(&stored_input, stored_output, 0).unwrap();
 
         let requested_input = compute_size_input(
             Size { width: Some(100.0), height: None },
             Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
         );
-        let (hit_entry_id, hit_output) = cache.get_with_entry(&requested_input).unwrap();
+        let (hit_entry_id, hit_output) = cache.get_with_entry(&requested_input, 0).unwrap();
 
         assert_eq!(hit_entry_id, stored_entry_id);
         assert_eq!(hit_output, LayoutOutput::from_outer_size(stored_output.size));
