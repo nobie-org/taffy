@@ -1,7 +1,7 @@
 //! A cache for storing the results of layout computation
-use crate::geometry::Size;
+use crate::geometry::{Line, Size};
 use crate::style::AvailableSpace;
-use crate::tree::{LayoutInput, LayoutOutput, NodeId, RunMode};
+use crate::tree::{LayoutInput, LayoutOutput, NodeId, RunMode, SizingMode};
 use core::fmt;
 
 /// The number of cache entries for each node in the tree
@@ -187,6 +187,12 @@ pub(crate) struct CacheEntry<T> {
     parent_size: Size<Option<f32>>,
     /// The initial cached size of the parent's node
     available_space: Size<AvailableSpace>,
+    /// Generation witness for descendant layout slots when this entry was stored.
+    descendant_layout_generation: u64,
+    /// Whether style sizes were included in this cached computation.
+    sizing_mode: SizingMode,
+    /// Whether block layout margins could collapse through this cached computation.
+    vertical_margins_are_collapsible: Line<bool>,
     /// The cached size and baselines of the item
     content: T,
 }
@@ -279,17 +285,45 @@ impl Cache {
         }
     }
 
+    #[inline]
+    fn nullable_size_matches(cached: Size<Option<f32>>, requested: Size<Option<f32>>) -> bool {
+        fn dimension_matches(cached: Option<f32>, requested: Option<f32>) -> bool {
+            match (cached, requested) {
+                (Some(cached), Some(requested)) => (cached - requested).abs() < f32::EPSILON,
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        dimension_matches(cached.width, requested.width) && dimension_matches(cached.height, requested.height)
+    }
+
+    #[inline]
+    fn parent_size_matches<T>(entry: &CacheEntry<T>, input: &LayoutInput) -> bool {
+        Self::nullable_size_matches(entry.parent_size, input.parent_size)
+    }
+
+    #[inline]
+    fn layout_context_matches<T>(entry: &CacheEntry<T>, input: &LayoutInput) -> bool {
+        Self::parent_size_matches(entry, input)
+            && entry.sizing_mode == input.sizing_mode
+            && entry.vertical_margins_are_collapsible == input.vertical_margins_are_collapsible
+    }
+
     /// Try to retrieve a cached result from the cache
     #[inline]
     pub fn get(&self, input: &LayoutInput) -> Option<LayoutOutput> {
-        self.get_with_entry(input).map(|(_, output)| output)
+        self.get_with_entry(input, 0).map(|(_, output)| output)
     }
 
     /// Try to retrieve a cached result and the entry that matched it.
     #[inline]
-    pub(crate) fn get_with_entry(&self, input: &LayoutInput) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
+    pub(crate) fn get_with_entry(
+        &self,
+        input: &LayoutInput,
+        descendant_layout_generation: u64,
+    ) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
         let known_dimensions = input.known_dimensions;
-        let parent_size = input.parent_size;
         let available_space = input.available_space;
 
         match input.run_mode {
@@ -297,11 +331,12 @@ impl Cache {
                 .final_layout_entry
                 .filter(|entry| {
                     let cached_size = entry.content.size;
-                    (known_dimensions.width == entry.known_dimensions.width
-                        || known_dimensions.width == Some(cached_size.width))
+                    Self::layout_context_matches(entry, input)
+                        && entry.descendant_layout_generation == descendant_layout_generation
+                        && (known_dimensions.width == entry.known_dimensions.width
+                            || known_dimensions.width == Some(cached_size.width))
                         && (known_dimensions.height == entry.known_dimensions.height
                             || known_dimensions.height == Some(cached_size.height))
-                        && maybe_size_is_roughly_equal(entry.parent_size, parent_size)
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
@@ -317,11 +352,11 @@ impl Cache {
                 {
                     let cached_size = entry.content;
 
-                    if (known_dimensions.width == entry.known_dimensions.width
-                        || known_dimensions.width == Some(cached_size.width))
+                    if Self::layout_context_matches(entry, input)
+                        && (known_dimensions.width == entry.known_dimensions.width
+                            || known_dimensions.width == Some(cached_size.width))
                         && (known_dimensions.height == entry.known_dimensions.height
                             || known_dimensions.height == Some(cached_size.height))
-                        && maybe_size_is_roughly_equal(entry.parent_size, parent_size)
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
@@ -339,7 +374,7 @@ impl Cache {
 
     /// Store a computed size in the cache
     pub fn store(&mut self, input: &LayoutInput, layout_output: LayoutOutput) {
-        self.store_with_entry(input, layout_output);
+        self.store_with_entry(input, layout_output, 0);
     }
 
     /// Store a computed size in the cache and return the entry that was written.
@@ -347,23 +382,40 @@ impl Cache {
         &mut self,
         input: &LayoutInput,
         layout_output: LayoutOutput,
+        descendant_layout_generation: u64,
     ) -> Option<LayoutCacheEntryId> {
         let known_dimensions = input.known_dimensions;
         let parent_size = input.parent_size;
         let available_space = input.available_space;
+        let sizing_mode = input.sizing_mode;
+        let vertical_margins_are_collapsible = input.vertical_margins_are_collapsible;
 
         match input.run_mode {
             RunMode::PerformLayout => {
                 self.is_empty = false;
-                self.final_layout_entry =
-                    Some(CacheEntry { known_dimensions, parent_size, available_space, content: layout_output });
+                self.final_layout_entry = Some(CacheEntry {
+                    known_dimensions,
+                    parent_size,
+                    available_space,
+                    descendant_layout_generation,
+                    sizing_mode,
+                    vertical_margins_are_collapsible,
+                    content: layout_output,
+                });
                 Some(LayoutCacheEntryId::FINAL_LAYOUT)
             }
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(known_dimensions, available_space);
-                self.measure_entries[cache_slot] =
-                    Some(CacheEntry { known_dimensions, parent_size, available_space, content: layout_output.size });
+                self.measure_entries[cache_slot] = Some(CacheEntry {
+                    known_dimensions,
+                    parent_size,
+                    available_space,
+                    descendant_layout_generation: 0,
+                    sizing_mode,
+                    vertical_margins_are_collapsible,
+                    content: layout_output.size,
+                });
                 Some(LayoutCacheEntryId::measure(cache_slot))
             }
             RunMode::PerformHiddenLayout => None,
@@ -387,18 +439,6 @@ impl Cache {
     }
 }
 
-fn maybe_size_is_roughly_equal(left: Size<Option<f32>>, right: Size<Option<f32>>) -> bool {
-    maybe_f32_is_roughly_equal(left.width, right.width) && maybe_f32_is_roughly_equal(left.height, right.height)
-}
-
-fn maybe_f32_is_roughly_equal(left: Option<f32>, right: Option<f32>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => (left - right).abs() < f32::EPSILON,
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,21 +459,87 @@ mod tests {
         }
     }
 
+    fn input_with_parent_size(run_mode: RunMode, parent_size: Size<Option<f32>>) -> LayoutInput {
+        LayoutInput {
+            run_mode,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: Size::NONE,
+            parent_size,
+            available_space: Size::MAX_CONTENT,
+            vertical_margins_are_collapsible: Line::FALSE,
+        }
+    }
+
+    fn stored_output() -> LayoutOutput {
+        LayoutOutput::from_outer_size(Size { width: 100.0, height: 0.0 })
+    }
+
     #[test]
     fn equivalent_compute_size_hit_returns_stored_entry_id() {
         let mut cache = Cache::new();
         let stored_input = compute_size_input(Size::NONE, Size::MAX_CONTENT);
         let stored_output = LayoutOutput::from_outer_size(Size { width: 100.0, height: 20.0 });
-        let stored_entry_id = cache.store_with_entry(&stored_input, stored_output).unwrap();
+        let stored_entry_id = cache.store_with_entry(&stored_input, stored_output, 0).unwrap();
 
         let requested_input = compute_size_input(
             Size { width: Some(100.0), height: None },
             Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
         );
-        let (hit_entry_id, hit_output) = cache.get_with_entry(&requested_input).unwrap();
+        let (hit_entry_id, hit_output) = cache.get_with_entry(&requested_input, 0).unwrap();
 
         assert_eq!(hit_entry_id, stored_entry_id);
         assert_eq!(hit_output, LayoutOutput::from_outer_size(stored_output.size));
+    }
+
+    #[test]
+    fn compute_size_cache_misses_when_parent_size_changes() {
+        let mut cache = Cache::new();
+        let stored_input = input_with_parent_size(RunMode::ComputeSize, Size { width: Some(100.0), height: Some(0.0) });
+        let requested_input =
+            input_with_parent_size(RunMode::ComputeSize, Size { width: Some(100.0), height: Some(200.0) });
+
+        cache.store(&stored_input, stored_output());
+
+        assert_eq!(cache.get(&requested_input), None);
+    }
+
+    #[test]
+    fn final_layout_cache_misses_when_parent_size_changes() {
+        let mut cache = Cache::new();
+        let stored_input =
+            input_with_parent_size(RunMode::PerformLayout, Size { width: Some(100.0), height: Some(0.0) });
+        let requested_input =
+            input_with_parent_size(RunMode::PerformLayout, Size { width: Some(100.0), height: Some(200.0) });
+
+        cache.store(&stored_input, stored_output());
+
+        assert_eq!(cache.get(&requested_input), None);
+    }
+
+    #[test]
+    fn cache_misses_when_sizing_mode_changes() {
+        let mut cache = Cache::new();
+        let stored_input = compute_size_input(Size::NONE, Size::MAX_CONTENT);
+        let mut requested_input = stored_input;
+        requested_input.sizing_mode = SizingMode::ContentSize;
+
+        cache.store(&stored_input, stored_output());
+
+        assert_eq!(cache.get(&requested_input), None);
+    }
+
+    #[test]
+    fn cache_misses_when_vertical_margin_collapse_context_changes() {
+        let mut cache = Cache::new();
+        let mut stored_input = input_with_parent_size(RunMode::PerformLayout, Size::NONE);
+        stored_input.vertical_margins_are_collapsible = Line::TRUE;
+        let mut requested_input = stored_input;
+        requested_input.vertical_margins_are_collapsible = Line::FALSE;
+
+        cache.store(&stored_input, stored_output());
+
+        assert_eq!(cache.get(&requested_input), None);
     }
 }
 
