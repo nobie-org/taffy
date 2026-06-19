@@ -59,6 +59,76 @@ fn relayout() {
 }
 
 #[test]
+fn repeated_root_solve_updates_scaled_list_measure_descendant_after_root_constraint_aba() {
+    type TestTree =
+        (taffy::TaffyTree<()>, taffy::tree::NodeId, taffy::tree::NodeId, taffy::tree::NodeId, taffy::tree::NodeId);
+
+    fn build_tree() -> TestTree {
+        let mut taffy = taffy::TaffyTree::new();
+        taffy.disable_rounding();
+        let block = || Style { display: Display::Block, ..Default::default() };
+        let measured = taffy.new_leaf_with_context(block(), ()).unwrap();
+        let fixed_width = taffy
+            .new_leaf(Style {
+                display: Display::Block,
+                size: Size { width: length(0.0), height: auto() },
+                ..Default::default()
+            })
+            .unwrap();
+        let inner = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    size: Size { width: length(0.0), height: length(0.0) },
+                    ..Default::default()
+                },
+                &[measured, fixed_width],
+            )
+            .unwrap();
+        let root = taffy.new_with_children(block(), &[inner]).unwrap();
+        (taffy, root, inner, measured, fixed_width)
+    }
+
+    let scale_factor = 2.0_f32;
+    let available_one = Size {
+        width: AvailableSpace::Definite(1.0 * scale_factor),
+        height: AvailableSpace::Definite(1.0 * scale_factor),
+    };
+    let available_two = Size {
+        width: AvailableSpace::Definite(1.0 * scale_factor),
+        height: AvailableSpace::Definite(2.0 * scale_factor),
+    };
+    let measure = move |known_dimensions: Size<Option<f32>>,
+                        available_space: Size<AvailableSpace>,
+                        _node_id,
+                        _context: Option<&mut ()>,
+                        _style: &Style| {
+        let width = known_dimensions.width.unwrap_or(match available_space.width {
+            AvailableSpace::Definite(width) => width / scale_factor,
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => 0.0,
+        });
+        let height = match available_space.height {
+            AvailableSpace::Definite(height) => 1.0_f32.min(height / scale_factor),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => 1.0,
+        };
+        Size { width: (width * scale_factor).ceil(), height: (height * scale_factor).ceil() }
+    };
+
+    let (mut retained, retained_root, retained_inner, retained_measured, retained_fixed_width) = build_tree();
+    retained.compute_layout_with_measure(retained_root, available_one, measure).unwrap();
+    retained.compute_layout_with_measure(retained_root, available_two, measure).unwrap();
+    retained.compute_layout_with_measure(retained_root, available_one, measure).unwrap();
+
+    let (mut fresh, fresh_root, fresh_inner, fresh_measured, fresh_fixed_width) = build_tree();
+    fresh.compute_layout_with_measure(fresh_root, available_one, measure).unwrap();
+
+    assert_eq!(retained.layout(retained_root).unwrap(), fresh.layout(fresh_root).unwrap());
+    assert_eq!(retained.layout(retained_inner).unwrap(), fresh.layout(fresh_inner).unwrap());
+    assert_eq!(retained.layout(retained_measured).unwrap(), fresh.layout(fresh_measured).unwrap());
+    assert_eq!(retained.layout(retained_fixed_width).unwrap(), fresh.layout(fresh_fixed_width).unwrap());
+}
+
+#[test]
 fn toggle_root_display_none() {
     let hidden_style = Style {
         display: Display::None,

@@ -352,6 +352,22 @@ where
             return compute_hidden_layout(self, node_id);
         }
 
+        #[cfg(feature = "block_layout")]
+        {
+            let display_mode = self.taffy.nodes[node_id.into()].style.display;
+            // An inherited BlockContext is mutable algorithm state that is not
+            // represented in LayoutInput or LayoutOutput. Do not serve cached
+            // final-layout entries for same-BFC block containers, because the
+            // block algorithm must run to update that context.
+            if block_ctx.is_some()
+                && inputs.run_mode == RunMode::PerformLayout
+                && display_mode == Display::Block
+                && self.child_count(node_id) > 0
+            {
+                return compute_block_layout(self, node_id, inputs, block_ctx);
+            }
+        }
+
         // We run the following wrapped in "compute_cached_layout", which will check the cache for an entry matching the node and inputs and:
         //   - Return that entry if exists
         //   - Else call the passed closure (below) to compute the result
