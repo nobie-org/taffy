@@ -111,6 +111,57 @@ impl LayoutCacheClear {
     }
 }
 
+/// Passive observation of a measured node query/result used by layout.
+///
+/// This event records the exact inputs passed to a measure function and the
+/// size returned from that measure function. It is emitted when a measure
+/// callback runs, and may be replayed when a cached layout result is reused.
+/// The observation is informational only; it does not affect cache lookup,
+/// dirtying, or layout output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutMeasureObservation {
+    /// The measured node.
+    node_id: NodeId,
+    /// Exact known dimensions passed to the measure function.
+    known_dimensions: Size<Option<f32>>,
+    /// Exact available space passed to the measure function.
+    available_space: Size<AvailableSpace>,
+    /// Size returned by the measure function.
+    measured_size: Size<f32>,
+}
+
+impl LayoutMeasureObservation {
+    /// Create a measure-observation event payload.
+    pub(crate) fn new(
+        node_id: NodeId,
+        known_dimensions: Size<Option<f32>>,
+        available_space: Size<AvailableSpace>,
+        measured_size: Size<f32>,
+    ) -> Self {
+        Self { node_id, known_dimensions, available_space, measured_size }
+    }
+
+    /// The measured node.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Exact known dimensions passed to the measure function.
+    pub fn known_dimensions(&self) -> Size<Option<f32>> {
+        self.known_dimensions
+    }
+
+    /// Exact available space passed to the measure function.
+    pub fn available_space(&self) -> Size<AvailableSpace> {
+        self.available_space
+    }
+
+    /// Size returned by the measure function.
+    pub fn measured_size(&self) -> Size<f32> {
+        self.measured_size
+    }
+}
+
 /// Passive layout-cache events emitted by `TaffyTree` compute methods.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -121,6 +172,8 @@ pub enum LayoutCacheEvent {
     Stored(LayoutCacheEntry),
     /// Taffy cleared all cache entries for a node during compute.
     Cleared(LayoutCacheClear),
+    /// Taffy used this exact measured-node query/result.
+    Measure(LayoutMeasureObservation),
 }
 
 /// Cached intermediate layout results
