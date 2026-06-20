@@ -309,7 +309,7 @@ where
 
     fn record_measure_observation(&self, observation: LayoutMeasureObservation) {
         for frame in self.measure_observation_stack.borrow_mut().iter_mut() {
-            frame.push(observation);
+            push_measure_observation(frame, observation);
         }
         (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Measure(observation));
     }
@@ -404,7 +404,7 @@ where
                         let observation =
                             LayoutMeasureObservation::new(node_id, known_dimensions, available_space, measured_size);
                         for frame in measure_observation_stack.borrow_mut().iter_mut() {
-                            frame.push(observation);
+                            push_measure_observation(frame, observation);
                         }
                         (cache_event_function.borrow_mut())(LayoutCacheEvent::Measure(observation));
                         measured_size
@@ -415,6 +415,12 @@ where
         });
         self.pop_measure_observation_frame();
         output
+    }
+}
+
+fn push_measure_observation(observations: &mut Vec<LayoutMeasureObservation>, observation: LayoutMeasureObservation) {
+    if !observations.contains(&observation) {
+        observations.push(observation);
     }
 }
 
