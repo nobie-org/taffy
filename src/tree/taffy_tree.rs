@@ -9,7 +9,9 @@ use slotmap::{DefaultKey, SlotMap};
 #[cfg(feature = "block_layout")]
 use crate::block::BlockContext;
 use crate::geometry::Size;
-use crate::style::{AvailableSpace, Display, Style};
+use crate::style::{AvailableSpace, Dimension, Display, LengthPercentage, LengthPercentageAuto, Style};
+#[cfg(feature = "grid")]
+use crate::style::{GridTemplateComponent, TrackSizingFunction};
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
     Cache, ClearState, Layout, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutInput,
@@ -602,10 +604,11 @@ where
     CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
+        let cache_input = cache_input_for_node(self, node_id, input);
         if !self.observe_cache_events {
-            return self.taffy.nodes[node_id.into()].cache.get(input);
+            return self.taffy.nodes[node_id.into()].cache.get(&cache_input);
         }
-        let (entry_id, output) = self.taffy.nodes[node_id.into()].cache.get_with_entry(input)?;
+        let (entry_id, output) = self.taffy.nodes[node_id.into()].cache.get_with_entry(&cache_input)?;
         (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Hit(LayoutCacheEntry::new(
             node_id, entry_id, *input, output,
         )));
@@ -614,11 +617,12 @@ where
     }
 
     fn cache_store(&mut self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput) {
+        let cache_input = cache_input_for_node(self, node_id, input);
         if !self.observe_cache_events {
-            self.taffy.nodes[node_id.into()].cache.store(input, layout_output);
+            self.taffy.nodes[node_id.into()].cache.store(&cache_input, layout_output);
             return;
         }
-        if let Some(entry_id) = self.taffy.nodes[node_id.into()].cache.store_with_entry(input, layout_output) {
+        if let Some(entry_id) = self.taffy.nodes[node_id.into()].cache.store_with_entry(&cache_input, layout_output) {
             self.store_measure_observations_for_cache_entry(node_id, entry_id);
             (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Stored(LayoutCacheEntry::new(
                 node_id,
@@ -634,6 +638,146 @@ where
         self.taffy.cache_measure_observations.remove(node_id.into());
         if self.observe_cache_events {
             (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Cleared(LayoutCacheClear::new(node_id)));
+        }
+    }
+}
+
+fn cache_input_for_node<NodeContext, MeasureFunction, CacheEventFunction>(
+    tree: &TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>,
+    node_id: NodeId,
+    input: &LayoutInput,
+) -> LayoutInput
+where
+    MeasureFunction:
+        FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
+{
+    let dependency = subtree_parent_size_dependency(tree, node_id);
+    let mut cache_input = *input;
+    cache_input.parent_size = Size {
+        width: dependency.width.then_some(input.parent_size.width).flatten(),
+        height: dependency.height.then_some(input.parent_size.height).flatten(),
+    };
+    cache_input
+}
+
+fn subtree_parent_size_dependency<NodeContext, MeasureFunction, CacheEventFunction>(
+    tree: &TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>,
+    node_id: NodeId,
+) -> Size<bool>
+where
+    MeasureFunction:
+        FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+    CacheEventFunction: FnMut(LayoutCacheEvent),
+{
+    let node = &tree.taffy.nodes[node_id.into()];
+    let mut dependency = style_parent_size_dependency(&node.style);
+    for child_id in tree.taffy.child_ids(node_id) {
+        dependency = or_size(dependency, subtree_parent_size_dependency(tree, child_id));
+    }
+    dependency
+}
+
+fn style_parent_size_dependency(style: &Style) -> Size<bool> {
+    let mut dependency = or_size(
+        or_size(
+            size_dimension_parent_size_dependency(style.size),
+            size_dimension_parent_size_dependency(style.min_size),
+        ),
+        size_dimension_parent_size_dependency(style.max_size),
+    );
+
+    dependency.width |= rect_length_percentage_auto_has_dependency(style.margin);
+    dependency.width |= rect_length_percentage_has_dependency(style.padding);
+    dependency.width |= rect_length_percentage_has_dependency(style.border);
+
+    dependency = or_size(dependency, rect_inset_parent_size_dependency(style.inset));
+
+    #[cfg(any(feature = "flexbox", feature = "grid"))]
+    {
+        dependency = or_size(dependency, size_length_percentage_parent_size_dependency(style.gap));
+    }
+
+    #[cfg(feature = "flexbox")]
+    {
+        if dimension_depends_on_parent_size(style.flex_basis) {
+            dependency.width = true;
+            dependency.height = true;
+        }
+    }
+
+    #[cfg(feature = "grid")]
+    {
+        dependency.width |= style.grid_template_columns.iter().any(grid_template_component_depends_on_parent_size);
+        dependency.height |= style.grid_template_rows.iter().any(grid_template_component_depends_on_parent_size);
+        dependency.width |= style.grid_auto_columns.iter().any(track_sizing_function_depends_on_parent_size);
+        dependency.height |= style.grid_auto_rows.iter().any(track_sizing_function_depends_on_parent_size);
+    }
+
+    dependency
+}
+
+fn or_size(left: Size<bool>, right: Size<bool>) -> Size<bool> {
+    Size { width: left.width || right.width, height: left.height || right.height }
+}
+
+fn size_dimension_parent_size_dependency(size: Size<Dimension>) -> Size<bool> {
+    Size { width: dimension_depends_on_parent_size(size.width), height: dimension_depends_on_parent_size(size.height) }
+}
+
+fn size_length_percentage_parent_size_dependency(size: Size<LengthPercentage>) -> Size<bool> {
+    Size {
+        width: length_percentage_depends_on_parent_size(size.width),
+        height: length_percentage_depends_on_parent_size(size.height),
+    }
+}
+
+fn rect_inset_parent_size_dependency(rect: crate::geometry::Rect<LengthPercentageAuto>) -> Size<bool> {
+    Size {
+        width: length_percentage_auto_depends_on_parent_size(rect.left)
+            || length_percentage_auto_depends_on_parent_size(rect.right),
+        height: length_percentage_auto_depends_on_parent_size(rect.top)
+            || length_percentage_auto_depends_on_parent_size(rect.bottom),
+    }
+}
+
+fn rect_length_percentage_auto_has_dependency(rect: crate::geometry::Rect<LengthPercentageAuto>) -> bool {
+    length_percentage_auto_depends_on_parent_size(rect.left)
+        || length_percentage_auto_depends_on_parent_size(rect.right)
+        || length_percentage_auto_depends_on_parent_size(rect.top)
+        || length_percentage_auto_depends_on_parent_size(rect.bottom)
+}
+
+fn rect_length_percentage_has_dependency(rect: crate::geometry::Rect<LengthPercentage>) -> bool {
+    length_percentage_depends_on_parent_size(rect.left)
+        || length_percentage_depends_on_parent_size(rect.right)
+        || length_percentage_depends_on_parent_size(rect.top)
+        || length_percentage_depends_on_parent_size(rect.bottom)
+}
+
+fn dimension_depends_on_parent_size(value: Dimension) -> bool {
+    value.into_raw().uses_percentage()
+}
+
+fn length_percentage_depends_on_parent_size(value: LengthPercentage) -> bool {
+    value.into_raw().uses_percentage()
+}
+
+fn length_percentage_auto_depends_on_parent_size(value: LengthPercentageAuto) -> bool {
+    value.into_raw().uses_percentage()
+}
+
+#[cfg(feature = "grid")]
+fn track_sizing_function_depends_on_parent_size(value: &TrackSizingFunction) -> bool {
+    value.min_sizing_function().uses_percentage() || value.max_sizing_function().uses_percentage()
+}
+
+#[cfg(feature = "grid")]
+fn grid_template_component_depends_on_parent_size(value: &GridTemplateComponent<DefaultCheapStr>) -> bool {
+    match value {
+        GridTemplateComponent::Single(track) => track_sizing_function_depends_on_parent_size(track),
+        GridTemplateComponent::Repeat(repetition) => {
+            repetition.tracks.iter().any(track_sizing_function_depends_on_parent_size)
         }
     }
 }

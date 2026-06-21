@@ -62,6 +62,8 @@ fn repeated_root_solve_updates_percent_descendant_after_root_constraint_change()
     let (mut fresh, fresh_root, fresh_parent, fresh_measured, fresh_full) = build_tree();
     fresh.compute_layout_with_measure(fresh_root, available_two, measure).unwrap();
 
+    assert_eq!(retained.layout(retained_full).unwrap().size.height, 2.0);
+    assert_eq!(fresh.layout(fresh_full).unwrap().size.height, 2.0);
     assert_eq!(retained.layout(retained_root).unwrap(), fresh.layout(fresh_root).unwrap());
     assert_eq!(retained.layout(retained_parent).unwrap(), fresh.layout(fresh_parent).unwrap());
     assert_eq!(retained.layout(retained_measured).unwrap(), fresh.layout(fresh_measured).unwrap());
