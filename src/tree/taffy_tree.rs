@@ -447,20 +447,34 @@ where
             return compute_hidden_layout(self, node_id);
         }
 
-        #[cfg(feature = "block_layout")]
-        {
-            let display_mode = self.taffy.nodes[node_id.into()].style.display;
-            // An inherited BlockContext is mutable algorithm state that is not
-            // represented in LayoutInput or LayoutOutput. Do not serve cached
-            // final-layout entries for same-BFC block containers, because the
-            // block algorithm must run to update that context.
-            if block_ctx.is_some()
-                && inputs.run_mode == RunMode::PerformLayout
-                && display_mode == Display::Block
-                && self.child_count(node_id) > 0
-            {
-                return compute_block_layout(self, node_id, inputs, block_ctx);
-            }
+        let display_mode = self.taffy.nodes[node_id.into()].style.display;
+        let has_children = self.child_count(node_id) > 0;
+
+        if inputs.run_mode == RunMode::PerformLayout && has_children {
+            debug_log!(display_mode);
+            debug_log_node!(inputs);
+
+            // A cached container output is not a complete final-layout result:
+            // public `layout(child)` reads depend on descendant layout slots
+            // written by the container algorithm. Sizing/measurement cache
+            // entries may still be used inside that algorithm, but the final
+            // PerformLayout pass itself must run unless the cache stores and
+            // replays descendant layouts too.
+            self.push_measure_observation_frame();
+            let output = match display_mode {
+                Display::None => compute_hidden_layout(self, node_id),
+                #[cfg(feature = "block_layout")]
+                Display::Block => compute_block_layout(self, node_id, inputs, block_ctx),
+                #[cfg(feature = "flexbox")]
+                Display::Flex => compute_flexbox_layout(self, node_id, inputs),
+                #[cfg(feature = "grid")]
+                Display::Grid => compute_grid_layout(self, node_id, inputs),
+                #[allow(unreachable_patterns)]
+                _ => compute_leaf_layout(inputs, self.get_core_container_style(node_id), |_, _| 0.0, |_, _| Size::ZERO),
+            };
+            self.cache_store(node_id, &inputs, output);
+            self.pop_measure_observation_frame();
+            return output;
         }
 
         // We run the following wrapped in "compute_cached_layout", which will check the cache for an entry matching the node and inputs and:
@@ -1482,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn final_layout_cache_hit_replays_descendant_measure_observations() {
+    fn container_final_layout_recomputes_but_replays_descendant_measure_observations() {
         let mut taffy: TaffyTree<Size<f32>> = TaffyTree::new();
         let measured = taffy.new_leaf_with_context(Style::default(), Size { width: 120.0, height: 30.0 }).unwrap();
         let root = taffy.new_with_children(Style { display: Display::Flex, ..Style::default() }, &[measured]).unwrap();
@@ -1530,18 +1544,23 @@ mod tests {
 
         assert_eq!(
             measure_calls, measure_calls_after_first_solve,
-            "final-layout cache hit should not call the descendant measure function"
+            "descendant measurement cache should not call the measure function"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, LayoutCacheEvent::Hit(entry)
+                    if entry.node_id() == root
+                        && entry.requested_input().run_mode == RunMode::PerformLayout)
+            }),
+            "container final-layout entries must not hit without descendant layout replay, got {events:?}"
         );
         assert!(
             events.iter().any(|event| {
-                matches!(
-                    event,
-                    LayoutCacheEvent::Hit(entry)
-                        if entry.node_id() == root
-                            && entry.requested_input().run_mode == RunMode::PerformLayout
-                )
+                matches!(event, LayoutCacheEvent::Stored(entry)
+                    if entry.node_id() == root
+                        && entry.requested_input().run_mode == RunMode::PerformLayout)
             }),
-            "expected root final-layout cache hit, got {events:?}"
+            "expected root final-layout store to mark the solved container clean, got {events:?}"
         );
         assert!(
             events.iter().any(|event| {
