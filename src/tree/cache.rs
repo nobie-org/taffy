@@ -182,6 +182,9 @@ pub enum LayoutCacheEvent {
 pub(crate) struct CacheEntry<T> {
     /// The initial cached size of the node itself
     known_dimensions: Size<Option<f32>>,
+    /// The parent-size cache discriminator. Tree backends may normalize this
+    /// to the axes that the cached node/subtree can actually observe.
+    parent_size: Size<Option<f32>>,
     /// The initial cached size of the parent's node
     available_space: Size<AvailableSpace>,
     /// The cached size and baselines of the item
@@ -286,6 +289,7 @@ impl Cache {
     #[inline]
     pub(crate) fn get_with_entry(&self, input: &LayoutInput) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
         let known_dimensions = input.known_dimensions;
+        let parent_size = input.parent_size;
         let available_space = input.available_space;
 
         match input.run_mode {
@@ -297,6 +301,7 @@ impl Cache {
                         || known_dimensions.width == Some(cached_size.width))
                         && (known_dimensions.height == entry.known_dimensions.height
                             || known_dimensions.height == Some(cached_size.height))
+                        && maybe_size_is_roughly_equal(entry.parent_size, parent_size)
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
@@ -316,6 +321,7 @@ impl Cache {
                         || known_dimensions.width == Some(cached_size.width))
                         && (known_dimensions.height == entry.known_dimensions.height
                             || known_dimensions.height == Some(cached_size.height))
+                        && maybe_size_is_roughly_equal(entry.parent_size, parent_size)
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
@@ -343,20 +349,21 @@ impl Cache {
         layout_output: LayoutOutput,
     ) -> Option<LayoutCacheEntryId> {
         let known_dimensions = input.known_dimensions;
+        let parent_size = input.parent_size;
         let available_space = input.available_space;
 
         match input.run_mode {
             RunMode::PerformLayout => {
                 self.is_empty = false;
                 self.final_layout_entry =
-                    Some(CacheEntry { known_dimensions, available_space, content: layout_output });
+                    Some(CacheEntry { known_dimensions, parent_size, available_space, content: layout_output });
                 Some(LayoutCacheEntryId::FINAL_LAYOUT)
             }
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(known_dimensions, available_space);
                 self.measure_entries[cache_slot] =
-                    Some(CacheEntry { known_dimensions, available_space, content: layout_output.size });
+                    Some(CacheEntry { known_dimensions, parent_size, available_space, content: layout_output.size });
                 Some(LayoutCacheEntryId::measure(cache_slot))
             }
             RunMode::PerformHiddenLayout => None,
@@ -377,6 +384,18 @@ impl Cache {
     /// Returns true if all cache entries are None, else false
     pub fn is_empty(&self) -> bool {
         self.final_layout_entry.is_none() && !self.measure_entries.iter().any(|entry| entry.is_some())
+    }
+}
+
+fn maybe_size_is_roughly_equal(left: Size<Option<f32>>, right: Size<Option<f32>>) -> bool {
+    maybe_f32_is_roughly_equal(left.width, right.width) && maybe_f32_is_roughly_equal(left.height, right.height)
+}
+
+fn maybe_f32_is_roughly_equal(left: Option<f32>, right: Option<f32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() < f32::EPSILON,
+        (None, None) => true,
+        _ => false,
     }
 }
 
