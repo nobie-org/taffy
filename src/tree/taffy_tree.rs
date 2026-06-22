@@ -987,6 +987,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         fn mark_dirty_recursive(
             nodes: &mut SlotMap<DefaultKey, NodeData>,
             parents: &SlotMap<DefaultKey, Option<NodeId>>,
+            cache_measure_observations: &mut SecondaryMap<DefaultKey, CacheMeasureObservations>,
             node_key: DefaultKey,
         ) {
             match nodes[node_key].mark_dirty() {
@@ -996,14 +997,15 @@ impl<NodeContext> TaffyTree<NodeContext> {
                     // as they should be marked as dirty already.
                 }
                 ClearState::Cleared => {
+                    let _ = cache_measure_observations.remove(node_key);
                     if let Some(Some(node)) = parents.get(node_key) {
-                        mark_dirty_recursive(nodes, parents, (*node).into());
+                        mark_dirty_recursive(nodes, parents, cache_measure_observations, (*node).into());
                     }
                 }
             }
         }
 
-        mark_dirty_recursive(&mut self.nodes, &self.parents, node.into());
+        mark_dirty_recursive(&mut self.nodes, &self.parents, &mut self.cache_measure_observations, node.into());
 
         Ok(())
     }
@@ -1258,6 +1260,36 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(event, LayoutCacheEvent::Cleared(clear) if clear.node_id() == node)),
             "expected clear event, got {events:?}",
+        );
+    }
+
+    #[test]
+    fn mark_dirty_discards_measure_observations_for_cleared_cache_entries() {
+        let mut taffy: TaffyTree<Size<f32>> = TaffyTree::new();
+        let node = taffy.new_leaf_with_context(Style::default(), Size { width: 100.0, height: 20.0 }).unwrap();
+
+        taffy
+            .compute_layout_with_measure_and_cache_events(node, Size::MAX_CONTENT, size_measure_function, |_| {})
+            .unwrap();
+        *taffy.get_node_context_mut(node).unwrap() = Size { width: 50.0, height: 20.0 };
+        taffy.mark_dirty(node).unwrap();
+
+        let mut events = sys::Vec::new();
+        taffy
+            .compute_layout_with_measure_and_cache_events(node, Size::MAX_CONTENT, size_measure_function, |event| {
+                events.push(event)
+            })
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    LayoutCacheEvent::Measure(measure) => Some(measure.measured_size()),
+                    _ => None,
+                })
+                .collect::<sys::Vec<_>>(),
+            sys::Vec::from([Size { width: 50.0, height: 20.0 }]),
         );
     }
 
