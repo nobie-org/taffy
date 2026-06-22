@@ -286,6 +286,8 @@ where
     pub(crate) cache_event_function: RefCell<CacheEventFunction>,
     /// Stack of measurement observations used to produce each active cache entry.
     pub(crate) measure_observation_stack: RefCell<Vec<Vec<LayoutMeasureObservation>>>,
+    /// Whether passive cache and measurement observations are enabled for this solve.
+    observe_cache_events: bool,
 }
 
 impl<NodeContext, MeasureFunction, CacheEventFunction> TaffyView<'_, NodeContext, MeasureFunction, CacheEventFunction>
@@ -295,10 +297,16 @@ where
     CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     fn push_measure_observation_frame(&self) {
+        if !self.observe_cache_events {
+            return;
+        }
         self.measure_observation_stack.borrow_mut().push(Vec::new());
     }
 
     fn pop_measure_observation_frame(&self) {
+        if !self.observe_cache_events {
+            return;
+        }
         let frame = self
             .measure_observation_stack
             .borrow_mut()
@@ -308,6 +316,9 @@ where
     }
 
     fn record_measure_observation(&self, observation: LayoutMeasureObservation) {
+        if !self.observe_cache_events {
+            return;
+        }
         for frame in self.measure_observation_stack.borrow_mut().iter_mut() {
             push_measure_observation(frame, observation);
         }
@@ -315,6 +326,9 @@ where
     }
 
     fn replay_measure_observations(&self, node_id: NodeId, entry_id: LayoutCacheEntryId) {
+        if !self.observe_cache_events {
+            return;
+        }
         let Some(entries) = self.taffy.cache_measure_observations.get(node_id.into()) else {
             return;
         };
@@ -327,6 +341,9 @@ where
     }
 
     fn store_measure_observations_for_cache_entry(&mut self, node_id: NodeId, entry_id: LayoutCacheEntryId) {
+        if !self.observe_cache_events {
+            return;
+        }
         let observations = self.measure_observation_stack.borrow().last().cloned().unwrap_or_default();
         let entries = self.taffy.cache_measure_observations.entry(node_id.into()).unwrap().or_insert_with(Vec::new);
         if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == entry_id) {
@@ -379,18 +396,25 @@ where
                     let style = &tree.taffy.nodes[node_key].style;
                     let has_context = tree.taffy.nodes[node_key].has_context;
                     let node_context = has_context.then(|| tree.taffy.node_context_data.get_mut(node_key)).flatten();
+                    let observe_cache_events = tree.observe_cache_events;
                     let cache_event_function = &tree.cache_event_function;
                     let measure_observation_stack = &tree.measure_observation_stack;
                     let measure_function = &mut tree.measure_function;
                     let measure_function = |known_dimensions, available_space| {
                         let measured_size =
                             measure_function(known_dimensions, available_space, node_id, node_context, style);
-                        let observation =
-                            LayoutMeasureObservation::new(node_id, known_dimensions, available_space, measured_size);
-                        for frame in measure_observation_stack.borrow_mut().iter_mut() {
-                            push_measure_observation(frame, observation);
+                        if observe_cache_events {
+                            let observation = LayoutMeasureObservation::new(
+                                node_id,
+                                known_dimensions,
+                                available_space,
+                                measured_size,
+                            );
+                            for frame in measure_observation_stack.borrow_mut().iter_mut() {
+                                push_measure_observation(frame, observation);
+                            }
+                            (cache_event_function.borrow_mut())(LayoutCacheEvent::Measure(observation));
                         }
-                        (cache_event_function.borrow_mut())(LayoutCacheEvent::Measure(observation));
                         measured_size
                     };
                     compute_leaf_layout(inputs, style, |_, _| 0.0, measure_function)
@@ -496,6 +520,9 @@ where
     CacheEventFunction: FnMut(LayoutCacheEvent),
 {
     fn cache_get(&self, node_id: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
+        if !self.observe_cache_events {
+            return self.taffy.nodes[node_id.into()].cache.get(input);
+        }
         let (entry_id, output) = self.taffy.nodes[node_id.into()].cache.get_with_entry(input)?;
         (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Hit(LayoutCacheEntry::new(
             node_id, entry_id, *input, output,
@@ -505,6 +532,10 @@ where
     }
 
     fn cache_store(&mut self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput) {
+        if !self.observe_cache_events {
+            self.taffy.nodes[node_id.into()].cache.store(input, layout_output);
+            return;
+        }
         if let Some(entry_id) = self.taffy.nodes[node_id.into()].cache.store_with_entry(input, layout_output) {
             self.store_measure_observations_for_cache_entry(node_id, entry_id);
             (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Stored(LayoutCacheEntry::new(
@@ -519,7 +550,9 @@ where
     fn cache_clear(&mut self, node_id: NodeId) {
         self.taffy.nodes[node_id.into()].cache.clear();
         self.taffy.cache_measure_observations.remove(node_id.into());
-        (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Cleared(LayoutCacheClear::new(node_id)));
+        if self.observe_cache_events {
+            (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Cleared(LayoutCacheClear::new(node_id)));
+        }
     }
 }
 
@@ -1025,7 +1058,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         MeasureFunction:
             FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
     {
-        self.compute_layout_with_measure_and_cache_events(node_id, available_space, measure_function, |_| {})
+        self.compute_layout_with_measure_internal(node_id, available_space, measure_function, |_| {}, false)
     }
 
     /// Updates the stored layout of the provided `node` and its children,
@@ -1042,12 +1075,35 @@ impl<NodeContext> TaffyTree<NodeContext> {
             FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
         CacheEventFunction: FnMut(LayoutCacheEvent),
     {
+        self.compute_layout_with_measure_internal(
+            node_id,
+            available_space,
+            measure_function,
+            cache_event_function,
+            true,
+        )
+    }
+
+    fn compute_layout_with_measure_internal<MeasureFunction, CacheEventFunction>(
+        &mut self,
+        node_id: NodeId,
+        available_space: Size<AvailableSpace>,
+        measure_function: MeasureFunction,
+        cache_event_function: CacheEventFunction,
+        observe_cache_events: bool,
+    ) -> Result<(), TaffyError>
+    where
+        MeasureFunction:
+            FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+        CacheEventFunction: FnMut(LayoutCacheEvent),
+    {
         let use_rounding = self.config.use_rounding;
         let mut taffy_view = TaffyView {
             taffy: self,
             measure_function,
             cache_event_function: RefCell::new(cache_event_function),
             measure_observation_stack: RefCell::new(Vec::new()),
+            observe_cache_events,
         };
         compute_root_layout(&mut taffy_view, node_id, available_space);
         if use_rounding {
@@ -1075,6 +1131,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             measure_function: |_, _, _, _, _| Size::ZERO,
             cache_event_function: RefCell::new(|_| {}),
             measure_observation_stack: RefCell::new(Vec::new()),
+            observe_cache_events: false,
         }
     }
 }
@@ -1165,6 +1222,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(with_events.layout(observed_node).unwrap(), without_events.layout(plain_node).unwrap());
+    }
+
+    #[test]
+    fn compute_layout_without_cache_events_does_not_store_measure_observations() {
+        let mut taffy: TaffyTree<Size<f32>> = TaffyTree::new();
+        let node = taffy.new_leaf_with_context(Style::default(), Size { width: 120.0, height: 30.0 }).unwrap();
+
+        taffy.compute_layout_with_measure(node, Size::MAX_CONTENT, size_measure_function).unwrap();
+
+        assert!(taffy.cache_measure_observations.get(node.into()).is_none());
     }
 
     #[test]
