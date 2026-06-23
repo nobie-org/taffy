@@ -10,8 +10,8 @@ mod node;
 pub mod traits;
 
 pub use cache::{
-    Cache, ClearState, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent,
-    LayoutMeasureObservation,
+    Cache, ClearState, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutCacheMiss,
+    LayoutCacheMissReason, LayoutMeasureObservation,
 };
 pub use layout::{CollapsibleMarginSet, Layout, LayoutInput, LayoutOutput, RequestedAxis, RunMode, SizingMode};
 pub use node::NodeId;

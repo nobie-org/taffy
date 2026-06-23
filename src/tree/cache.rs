@@ -111,6 +111,94 @@ impl LayoutCacheClear {
     }
 }
 
+/// Why Taffy did not reuse a layout-cache entry for one requested input.
+///
+/// This is a passive observation only. It reports which cache discriminator
+/// rejected a lookup; it does not affect cache lookup, dirtying, or layout
+/// output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LayoutCacheMissReason {
+    /// No entry exists in the relevant cache slot.
+    NoEntry,
+    /// The requested parent-size/sizing-mode/collapsible-margin context differs.
+    LayoutContextMismatch,
+    /// Descendant layout slots were written since the final-layout entry was stored.
+    DescendantLayoutGenerationMismatch,
+    /// Requested known dimensions no longer match the cached dimensions/output.
+    KnownDimensionsMismatch,
+    /// Requested available space no longer matches the cached available space.
+    AvailableSpaceMismatch,
+}
+
+/// A passive observation that Taffy did not reuse a cache entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutCacheMiss {
+    /// The node whose cache was queried.
+    node_id: NodeId,
+    /// The raw input requested by the layout algorithm.
+    requested_input: LayoutInput,
+    /// The normalized input Taffy used as the cache lookup key.
+    cache_input: LayoutInput,
+    /// The first discriminator that rejected the lookup.
+    reason: LayoutCacheMissReason,
+    /// Current descendant-layout generation used for this lookup.
+    descendant_layout_generation: u64,
+    /// Stored generation on the final-layout cache entry, when one exists.
+    cached_descendant_layout_generation: Option<u64>,
+}
+
+impl LayoutCacheMiss {
+    /// Create a cache-miss event payload.
+    pub(crate) fn new(
+        node_id: NodeId,
+        requested_input: LayoutInput,
+        cache_input: LayoutInput,
+        reason: LayoutCacheMissReason,
+        descendant_layout_generation: u64,
+        cached_descendant_layout_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            node_id,
+            requested_input,
+            cache_input,
+            reason,
+            descendant_layout_generation,
+            cached_descendant_layout_generation,
+        }
+    }
+
+    /// The node whose cache was queried.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// The raw input requested by the layout algorithm.
+    pub fn requested_input(&self) -> LayoutInput {
+        self.requested_input
+    }
+
+    /// The normalized input Taffy used as the cache lookup key.
+    pub fn cache_input(&self) -> LayoutInput {
+        self.cache_input
+    }
+
+    /// The first discriminator that rejected the lookup.
+    pub fn reason(&self) -> LayoutCacheMissReason {
+        self.reason
+    }
+
+    /// Current descendant-layout generation used for this lookup.
+    pub fn descendant_layout_generation(&self) -> u64 {
+        self.descendant_layout_generation
+    }
+
+    /// Stored generation on the final-layout cache entry, when one exists.
+    pub fn cached_descendant_layout_generation(&self) -> Option<u64> {
+        self.cached_descendant_layout_generation
+    }
+}
+
 /// Passive observation of a measured node query/result used by layout.
 ///
 /// This event records the exact inputs passed to a measure function and the
@@ -170,6 +258,8 @@ pub enum LayoutCacheEvent {
     Hit(LayoutCacheEntry),
     /// Taffy stored a newly-computed layout result.
     Stored(LayoutCacheEntry),
+    /// Taffy did not reuse a cached layout result.
+    Miss(LayoutCacheMiss),
     /// Taffy cleared all cache entries for a node during compute.
     Cleared(LayoutCacheClear),
     /// Taffy used this exact measured-node query/result.
@@ -370,6 +460,49 @@ impl Cache {
             }
             RunMode::PerformHiddenLayout => None,
         }
+    }
+
+    /// Explain why a cache lookup would miss for the provided input.
+    pub(crate) fn miss_reason(&self, input: &LayoutInput, descendant_layout_generation: u64) -> LayoutCacheMissReason {
+        let known_dimensions = input.known_dimensions;
+        let available_space = input.available_space;
+
+        match input.run_mode {
+            RunMode::PerformLayout => {
+                let Some(entry) = self.final_layout_entry else {
+                    return LayoutCacheMissReason::NoEntry;
+                };
+                let cached_size = entry.content.size;
+                if !Self::layout_context_matches(&entry, input) {
+                    return LayoutCacheMissReason::LayoutContextMismatch;
+                }
+                if entry.descendant_layout_generation != descendant_layout_generation {
+                    return LayoutCacheMissReason::DescendantLayoutGenerationMismatch;
+                }
+                if !(known_dimensions.width == entry.known_dimensions.width
+                    || known_dimensions.width == Some(cached_size.width))
+                    || !(known_dimensions.height == entry.known_dimensions.height
+                        || known_dimensions.height == Some(cached_size.height))
+                {
+                    return LayoutCacheMissReason::KnownDimensionsMismatch;
+                }
+                if !(known_dimensions.width.is_some()
+                    || entry.available_space.width.is_roughly_equal(available_space.width))
+                    || !(known_dimensions.height.is_some()
+                        || entry.available_space.height.is_roughly_equal(available_space.height))
+                {
+                    return LayoutCacheMissReason::AvailableSpaceMismatch;
+                }
+                LayoutCacheMissReason::NoEntry
+            }
+            RunMode::ComputeSize => LayoutCacheMissReason::NoEntry,
+            RunMode::PerformHiddenLayout => LayoutCacheMissReason::NoEntry,
+        }
+    }
+
+    /// Stored generation on the final-layout cache entry, when one exists.
+    pub(crate) fn final_layout_descendant_layout_generation(&self) -> Option<u64> {
+        self.final_layout_entry.map(|entry| entry.descendant_layout_generation)
     }
 
     /// Store a computed size in the cache

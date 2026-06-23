@@ -15,9 +15,9 @@ use crate::style::{GridTemplateComponent, TrackSizingFunction};
 use crate::style_helpers::TaffyAuto as _;
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
-    Cache, ClearState, Layout, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutInput,
-    LayoutMeasureObservation, LayoutOutput, LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode, SizingMode,
-    TraversePartialTree, TraverseTree,
+    Cache, ClearState, Layout, LayoutCacheClear, LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent,
+    LayoutCacheMiss, LayoutInput, LayoutMeasureObservation, LayoutOutput, LayoutPartialTree, NodeId, PrintTree,
+    RoundTree, RunMode, SizingMode, TraversePartialTree, TraverseTree,
 };
 use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
@@ -770,7 +770,22 @@ where
             return None;
         }
         let cache_input = cache_input_for_node(&node.style, has_children, input);
-        let (entry_id, output) = node.cache.get_with_entry(&cache_input, node.descendant_layout_generation)?;
+        let (entry_id, output) = match node.cache.get_with_entry(&cache_input, node.descendant_layout_generation) {
+            Some(entry) => entry,
+            None => {
+                if self.observe_cache_events {
+                    (self.cache_event_function.borrow_mut())(LayoutCacheEvent::Miss(LayoutCacheMiss::new(
+                        node_id,
+                        *input,
+                        cache_input,
+                        node.cache.miss_reason(&cache_input, node.descendant_layout_generation),
+                        node.descendant_layout_generation,
+                        node.cache.final_layout_descendant_layout_generation(),
+                    )));
+                }
+                return None;
+            }
+        };
         if !self.observe_cache_events {
             return Some(output);
         }
@@ -1696,6 +1711,75 @@ mod tests {
             "expected unchanged root cache hit, got {events:?}",
         );
         assert_eq!(taffy.layout(child).unwrap().size, Size { width: 100.0, height: 100.0 });
+    }
+
+    #[test]
+    fn stable_flex_child_container_final_cache_hits_when_sibling_changes() {
+        let child_style = Style {
+            size: Size { width: Dimension::from_length(10.0_f32), height: Dimension::from_length(10.0_f32) },
+            ..Style::default()
+        };
+        let appearance_style =
+            Style { display: Display::Flex, flex_direction: FlexDirection::Column, ..Style::default() };
+        let root_style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            size: Size { width: Dimension::from_length(100.0_f32), height: Dimension::from_length(100.0_f32) },
+            ..Style::default()
+        };
+        let available_space = Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::Definite(100.0) };
+
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let children = (0..4).map(|_| taffy.new_leaf(child_style.clone()).unwrap()).collect::<sys::Vec<_>>();
+        let appearance = taffy.new_with_children(appearance_style, &children).unwrap();
+        let dynamic_sibling = taffy
+            .new_leaf(Style {
+                size: Size { width: Dimension::from_length(10.0_f32), height: Dimension::from_length(10.0_f32) },
+                ..Style::default()
+            })
+            .unwrap();
+        let root = taffy.new_with_children(root_style, &[appearance, dynamic_sibling]).unwrap();
+
+        taffy
+            .compute_layout_with_measure_and_cache_events(root, available_space, |_, _, _, _, _| Size::ZERO, |_| {})
+            .unwrap();
+
+        taffy
+            .set_style(
+                dynamic_sibling,
+                Style {
+                    size: Size { width: Dimension::from_length(11.0_f32), height: Dimension::from_length(10.0_f32) },
+                    ..Style::default()
+                },
+            )
+            .unwrap();
+
+        let mut events = sys::Vec::new();
+        taffy
+            .compute_layout_with_measure_and_cache_events(
+                root,
+                available_space,
+                |_, _, _, _, _| Size::ZERO,
+                |event| events.push(event),
+            )
+            .unwrap();
+
+        assert!(
+            events.iter().any(|event| {
+                matches!(event, LayoutCacheEvent::Hit(entry)
+                    if entry.node_id() == appearance
+                        && entry.requested_input().run_mode == RunMode::PerformLayout)
+            }),
+            "unchanged flex child container should hit final-layout cache when only a sibling changed, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, LayoutCacheEvent::Stored(entry)
+                    if entry.node_id() == appearance
+                        && entry.requested_input().run_mode == RunMode::PerformLayout)
+            }),
+            "unchanged flex child container should not store final layout again, got {events:?}"
+        );
     }
 
     #[test]
