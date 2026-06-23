@@ -294,6 +294,33 @@ where
             return compute_hidden_layout(self, node_id);
         }
 
+        let display_mode = self.taffy.nodes[node_id.into()].style.display;
+        let has_children = self.child_count(node_id) > 0;
+
+        if inputs.run_mode == RunMode::PerformLayout && has_children {
+            debug_log!(display_mode);
+            debug_log_node!(inputs);
+
+            // A container final-layout cache hit is not just a size answer:
+            // the container algorithms also refresh descendant layout slots
+            // that public `layout(child)` reads after the root solve.
+            // Re-run the container final-layout pass unless/until the cache
+            // can replay those descendant writes as part of the hit.
+            let output = match display_mode {
+                Display::None => compute_hidden_layout(self, node_id),
+                #[cfg(feature = "block_layout")]
+                Display::Block => compute_block_layout(self, node_id, inputs, block_ctx),
+                #[cfg(feature = "flexbox")]
+                Display::Flex => compute_flexbox_layout(self, node_id, inputs),
+                #[cfg(feature = "grid")]
+                Display::Grid => compute_grid_layout(self, node_id, inputs),
+                #[allow(unreachable_patterns)]
+                _ => compute_leaf_layout(inputs, self.get_core_container_style(node_id), |_, _| 0.0, |_, _| Size::ZERO),
+            };
+            self.cache_store(node_id, &inputs, output);
+            return output;
+        }
+
         // We run the following wrapped in "compute_cached_layout", which will check the cache for an entry matching the node and inputs and:
         //   - Return that entry if exists
         //   - Else call the passed closure (below) to compute the result

@@ -185,6 +185,189 @@ fn toggle_flex_child_display_none() {
 }
 
 #[test]
+fn retained_root_solve_refreshes_stable_sibling_descendant_layout_slots() {
+    use taffy::{Overflow, Point};
+
+    fn fixed_leaf(tree: &mut TaffyTree<()>, width: Option<f32>, height: Option<f32>) -> NodeId {
+        tree.new_leaf(Style {
+            size: Size {
+                width: width.map(Dimension::length).unwrap_or(Dimension::AUTO),
+                height: height.map(Dimension::length).unwrap_or(Dimension::AUTO),
+            },
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn full_leaf(tree: &mut TaffyTree<()>) -> NodeId {
+        tree.new_leaf(Style {
+            size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn block(tree: &mut TaffyTree<()>, children: &[NodeId]) -> NodeId {
+        tree.new_with_children(
+            Style {
+                display: Display::Block,
+                min_size: Size { width: Dimension::length(0.0), height: Dimension::length(0.0) },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..Default::default()
+            },
+            children,
+        )
+        .unwrap()
+    }
+
+    fn full_block(tree: &mut TaffyTree<()>, children: &[NodeId]) -> NodeId {
+        tree.new_with_children(
+            Style {
+                display: Display::Block,
+                size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden },
+                ..Default::default()
+            },
+            children,
+        )
+        .unwrap()
+    }
+
+    fn flex_row(tree: &mut TaffyTree<()>, children: &[NodeId]) -> NodeId {
+        tree.new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                min_size: Size { width: Dimension::length(0.0), height: Dimension::length(0.0) },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..Default::default()
+            },
+            children,
+        )
+        .unwrap()
+    }
+
+    fn flex_column(tree: &mut TaffyTree<()>, children: &[NodeId]) -> NodeId {
+        tree.new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                min_size: Size { width: Dimension::length(0.0), height: Dimension::length(0.0) },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..Default::default()
+            },
+            children,
+        )
+        .unwrap()
+    }
+
+    fn panel(tree: &mut TaffyTree<()>, header: NodeId, child: NodeId) -> NodeId {
+        tree.new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden },
+                border: Rect {
+                    left: LengthPercentage::length(2.0),
+                    right: LengthPercentage::length(0.0),
+                    top: LengthPercentage::length(2.0),
+                    bottom: LengthPercentage::length(2.0),
+                },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..Default::default()
+            },
+            &[header, child],
+        )
+        .unwrap()
+    }
+
+    fn set_sidebar_content_height(tree: &mut TaffyTree<()>, content: NodeId, height: f32) {
+        tree.set_style(
+            content,
+            Style { size: Size { width: Dimension::AUTO, height: Dimension::length(height) }, ..Default::default() },
+        )
+        .unwrap();
+    }
+
+    let mut tree = TaffyTree::new();
+    tree.disable_rounding();
+
+    let canvas = full_leaf(&mut tree);
+    let overlay = tree.new_leaf(Style { position: Position::Absolute, ..Default::default() }).unwrap();
+    let canvas_host = full_block(&mut tree, &[canvas, overlay]);
+    let canvas_flex_child = block(&mut tree, &[canvas_host]);
+    let header = fixed_leaf(&mut tree, None, Some(70.0));
+    let panel = panel(&mut tree, header, canvas_flex_child);
+    let sidebar_content = fixed_leaf(&mut tree, None, Some(0.0));
+    let sidebar = tree
+        .new_with_children(
+            Style {
+                display: Display::Block,
+                size: Size { width: Dimension::length(0.0), height: Dimension::percent(1.0) },
+                ..Default::default()
+            },
+            &[sidebar_content],
+        )
+        .unwrap();
+    let content_row = flex_row(&mut tree, &[panel, sidebar]);
+    let padded_row = tree
+        .new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                min_size: Size { width: Dimension::length(0.0), height: Dimension::length(0.0) },
+                padding: Rect {
+                    left: LengthPercentage::length(21.0),
+                    right: LengthPercentage::length(21.0),
+                    top: LengthPercentage::length(28.0),
+                    bottom: LengthPercentage::length(21.0),
+                },
+                flex_grow: 1.0,
+                flex_shrink: 1.0,
+                ..Default::default()
+            },
+            &[content_row],
+        )
+        .unwrap();
+    let footer = fixed_leaf(&mut tree, None, Some(98.0));
+    let lower_column = flex_column(&mut tree, &[padded_row, footer]);
+    let main_row = flex_row(&mut tree, &[lower_column]);
+    let top_chrome = fixed_leaf(&mut tree, None, Some(156.0));
+    let root = tree
+        .new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+                ..Default::default()
+            },
+            &[top_chrome, main_row],
+        )
+        .unwrap();
+
+    let available_space = Size { width: AvailableSpace::Definite(1100.0), height: AvailableSpace::Definite(760.0) };
+
+    set_sidebar_content_height(&mut tree, sidebar_content, 0.0);
+    tree.compute_layout(root, available_space).unwrap();
+    assert_eq!(tree.layout(canvas_host).unwrap().size, Size { width: 1056.0, height: 383.0 });
+    assert_eq!(tree.layout(canvas).unwrap().size, Size { width: 1056.0, height: 383.0 });
+
+    set_sidebar_content_height(&mut tree, sidebar_content, 1.0);
+    tree.compute_layout(root, available_space).unwrap();
+
+    assert_eq!(tree.layout(panel).unwrap().size, Size { width: 1058.0, height: 457.0 });
+    assert_eq!(tree.layout(canvas_flex_child).unwrap().size, Size { width: 1056.0, height: 383.0 });
+    assert_eq!(tree.layout(canvas_host).unwrap().size, Size { width: 1056.0, height: 383.0 });
+    assert_eq!(tree.layout(canvas).unwrap().size, Size { width: 1056.0, height: 383.0 });
+}
+
+#[test]
 fn toggle_flex_container_display_none() {
     let hidden_style = Style {
         display: Display::None,
