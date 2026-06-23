@@ -1,5 +1,6 @@
 mod hand_written {
     mod border_and_padding;
+    mod cache_parent_size;
     mod caching;
     mod measure;
     mod min_max_overrides;
