@@ -1,10 +1,180 @@
 //! A cache for storing the results of layout computation
 use crate::geometry::Size;
 use crate::style::AvailableSpace;
-use crate::tree::{LayoutInput, LayoutOutput, RunMode};
+use crate::tree::{LayoutInput, LayoutOutput, NodeId, RunMode};
+use core::fmt;
 
 /// The number of cache entries for each node in the tree
 const CACHE_SIZE: usize = 9;
+
+/// Opaque identity for one cache entry within a single node's layout cache.
+///
+/// This identifies the entry Taffy stored or selected. It is intentionally not
+/// a public slot number and is meaningful only together with the [`NodeId`] from
+/// the corresponding [`LayoutCacheEntry`].
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct LayoutCacheEntryId {
+    /// Private cache-entry discriminator.
+    kind: LayoutCacheEntryKind,
+}
+
+impl fmt::Debug for LayoutCacheEntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LayoutCacheEntryId(..)")
+    }
+}
+
+/// Private cache-entry discriminator.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum LayoutCacheEntryKind {
+    /// The final layout entry for a full layout pass.
+    FinalLayout,
+    /// One of the intrinsic-size measurement cache slots.
+    Measure {
+        /// Private slot index in the node's measurement cache.
+        slot: u8,
+    },
+}
+
+impl LayoutCacheEntryId {
+    /// Opaque identity for the final-layout cache entry.
+    const FINAL_LAYOUT: Self = Self { kind: LayoutCacheEntryKind::FinalLayout };
+
+    /// Construct an opaque identity for a measurement cache slot.
+    fn measure(slot: usize) -> Self {
+        debug_assert!(slot < CACHE_SIZE);
+        Self { kind: LayoutCacheEntryKind::Measure { slot: slot as u8 } }
+    }
+}
+
+/// A passive observation of a cache entry Taffy stored or selected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutCacheEntry {
+    /// The node whose cache stored or selected this entry.
+    node_id: NodeId,
+    /// Opaque identity of the stored or selected cache entry.
+    entry_id: LayoutCacheEntryId,
+    /// The input requested by the layout algorithm for this event.
+    requested_input: LayoutInput,
+    /// The output returned to the layout algorithm for this event.
+    returned_output: LayoutOutput,
+}
+
+impl LayoutCacheEntry {
+    /// Create a cache-entry event payload.
+    pub(crate) fn new(
+        node_id: NodeId,
+        entry_id: LayoutCacheEntryId,
+        requested_input: LayoutInput,
+        returned_output: LayoutOutput,
+    ) -> Self {
+        Self { node_id, entry_id, requested_input, returned_output }
+    }
+
+    /// The node whose cache stored or selected this entry.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Opaque identity of the stored or selected cache entry.
+    pub fn entry_id(&self) -> LayoutCacheEntryId {
+        self.entry_id
+    }
+
+    /// The input requested by the layout algorithm for this event.
+    pub fn requested_input(&self) -> LayoutInput {
+        self.requested_input
+    }
+
+    /// The output returned to the layout algorithm for this event.
+    pub fn returned_output(&self) -> LayoutOutput {
+        self.returned_output
+    }
+}
+
+/// A passive observation that Taffy cleared all cache entries for a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutCacheClear {
+    /// The node whose cache was cleared.
+    node_id: NodeId,
+}
+
+impl LayoutCacheClear {
+    /// Create a cache-clear event payload.
+    pub(crate) fn new(node_id: NodeId) -> Self {
+        Self { node_id }
+    }
+
+    /// The node whose cache was cleared.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
+
+/// Passive observation of a measured node query/result used by layout.
+///
+/// This event records the exact inputs passed to a measure function and the
+/// size returned from that measure function. It is emitted when a measure
+/// callback runs, and may be replayed when a cached layout result is reused.
+/// The observation is informational only; it does not affect cache lookup,
+/// dirtying, or layout output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutMeasureObservation {
+    /// The measured node.
+    node_id: NodeId,
+    /// Exact known dimensions passed to the measure function.
+    known_dimensions: Size<Option<f32>>,
+    /// Exact available space passed to the measure function.
+    available_space: Size<AvailableSpace>,
+    /// Size returned by the measure function.
+    measured_size: Size<f32>,
+}
+
+impl LayoutMeasureObservation {
+    /// Create a measure-observation event payload.
+    pub(crate) fn new(
+        node_id: NodeId,
+        known_dimensions: Size<Option<f32>>,
+        available_space: Size<AvailableSpace>,
+        measured_size: Size<f32>,
+    ) -> Self {
+        Self { node_id, known_dimensions, available_space, measured_size }
+    }
+
+    /// The measured node.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Exact known dimensions passed to the measure function.
+    pub fn known_dimensions(&self) -> Size<Option<f32>> {
+        self.known_dimensions
+    }
+
+    /// Exact available space passed to the measure function.
+    pub fn available_space(&self) -> Size<AvailableSpace> {
+        self.available_space
+    }
+
+    /// Size returned by the measure function.
+    pub fn measured_size(&self) -> Size<f32> {
+        self.measured_size
+    }
+}
+
+/// Passive layout-cache events emitted by `TaffyTree` compute methods.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum LayoutCacheEvent {
+    /// Taffy reused a cached layout result.
+    Hit(LayoutCacheEntry),
+    /// Taffy stored a newly-computed layout result.
+    Stored(LayoutCacheEntry),
+    /// Taffy cleared all cache entries for a node during compute.
+    Cleared(LayoutCacheClear),
+    /// Taffy used this exact measured-node query/result.
+    Measure(LayoutMeasureObservation),
+}
 
 /// Cached intermediate layout results
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +279,12 @@ impl Cache {
     /// Try to retrieve a cached result from the cache
     #[inline]
     pub fn get(&self, input: &LayoutInput) -> Option<LayoutOutput> {
+        self.get_with_entry(input).map(|(_, output)| output)
+    }
+
+    /// Try to retrieve a cached result and the entry that matched it.
+    #[inline]
+    pub(crate) fn get_with_entry(&self, input: &LayoutInput) -> Option<(LayoutCacheEntryId, LayoutOutput)> {
         let known_dimensions = input.known_dimensions;
         let available_space = input.available_space;
 
@@ -126,9 +302,14 @@ impl Cache {
                         && (known_dimensions.height.is_some()
                             || entry.available_space.height.is_roughly_equal(available_space.height))
                 })
-                .map(|e| e.content),
+                .map(|e| (LayoutCacheEntryId::FINAL_LAYOUT, e.content)),
             RunMode::ComputeSize => {
-                for entry in self.measure_entries.iter().flatten() {
+                for (slot, entry) in self
+                    .measure_entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, entry)| entry.as_ref().map(|entry| (slot, entry)))
+                {
                     let cached_size = entry.content;
 
                     if (known_dimensions.width == entry.known_dimensions.width
@@ -140,7 +321,7 @@ impl Cache {
                         && (known_dimensions.height.is_some()
                             || entry.available_space.height.is_roughly_equal(available_space.height))
                     {
-                        return Some(LayoutOutput::from_outer_size(cached_size));
+                        return Some((LayoutCacheEntryId::measure(slot), LayoutOutput::from_outer_size(cached_size)));
                     }
                 }
 
@@ -152,21 +333,33 @@ impl Cache {
 
     /// Store a computed size in the cache
     pub fn store(&mut self, input: &LayoutInput, layout_output: LayoutOutput) {
+        self.store_with_entry(input, layout_output);
+    }
+
+    /// Store a computed size in the cache and return the entry that was written.
+    pub(crate) fn store_with_entry(
+        &mut self,
+        input: &LayoutInput,
+        layout_output: LayoutOutput,
+    ) -> Option<LayoutCacheEntryId> {
         let known_dimensions = input.known_dimensions;
         let available_space = input.available_space;
 
         match input.run_mode {
             RunMode::PerformLayout => {
                 self.is_empty = false;
-                self.final_layout_entry = Some(CacheEntry { known_dimensions, available_space, content: layout_output })
+                self.final_layout_entry =
+                    Some(CacheEntry { known_dimensions, available_space, content: layout_output });
+                Some(LayoutCacheEntryId::FINAL_LAYOUT)
             }
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(known_dimensions, available_space);
                 self.measure_entries[cache_slot] =
                     Some(CacheEntry { known_dimensions, available_space, content: layout_output.size });
+                Some(LayoutCacheEntryId::measure(cache_slot))
             }
-            RunMode::PerformHiddenLayout => {}
+            RunMode::PerformHiddenLayout => None,
         }
     }
 
@@ -184,6 +377,44 @@ impl Cache {
     /// Returns true if all cache entries are None, else false
     pub fn is_empty(&self) -> bool {
         self.final_layout_entry.is_none() && !self.measure_entries.iter().any(|entry| entry.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Line;
+    use crate::style::AvailableSpace;
+    use crate::style_helpers::TaffyMaxContent;
+    use crate::tree::{RequestedAxis, SizingMode};
+
+    fn compute_size_input(known_dimensions: Size<Option<f32>>, available_space: Size<AvailableSpace>) -> LayoutInput {
+        LayoutInput {
+            run_mode: RunMode::ComputeSize,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions,
+            parent_size: Size::NONE,
+            available_space,
+            vertical_margins_are_collapsible: Line::FALSE,
+        }
+    }
+
+    #[test]
+    fn equivalent_compute_size_hit_returns_stored_entry_id() {
+        let mut cache = Cache::new();
+        let stored_input = compute_size_input(Size::NONE, Size::MAX_CONTENT);
+        let stored_output = LayoutOutput::from_outer_size(Size { width: 100.0, height: 20.0 });
+        let stored_entry_id = cache.store_with_entry(&stored_input, stored_output).unwrap();
+
+        let requested_input = compute_size_input(
+            Size { width: Some(100.0), height: None },
+            Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
+        );
+        let (hit_entry_id, hit_output) = cache.get_with_entry(&requested_input).unwrap();
+
+        assert_eq!(hit_entry_id, stored_entry_id);
+        assert_eq!(hit_output, LayoutOutput::from_outer_size(stored_output.size));
     }
 }
 
