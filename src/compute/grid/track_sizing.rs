@@ -1474,4 +1474,28 @@ mod tests {
 
         assert_eq!((remaining_space, increases), (0.0234375, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0078125]));
     }
+
+    #[test]
+    fn distribute_space_terminates_when_limit_rounding_exceeds_threshold() {
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].base_size = 1_342_845.25;
+        tracks[0].growth_limit = 1_539_331.375;
+        tracks[1].base_size = 173_275.75;
+        tracks[1].growth_limit = 3_674_469.25;
+
+        let remaining_space = distribute_space_up_to_limits(
+            10_000_000.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (6_302_320.5, [196_486.125, 3_501_193.5]));
+    }
 }
