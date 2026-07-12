@@ -1432,6 +1432,14 @@ mod tests {
     use crate::style::{MaxTrackSizingFunction, MinTrackSizingFunction};
     use core::cell::Cell;
 
+    fn power_of_two(exponent: i32) -> f32 {
+        f32::from_bits(((exponent + 127) as u32) << 23)
+    }
+
+    fn previous_f32(value: f32) -> f32 {
+        f32::from_bits(value.to_bits() - 1)
+    }
+
     #[test]
     fn distribute_space_accounts_for_prior_item_incurred_increase() {
         let mut tracks = [
@@ -1590,5 +1598,129 @@ mod tests {
             ),
             (0.999_999_5, [33_554_432.0, 4.768_369_3e-7], 2, 2, 2, 2,)
         );
+    }
+
+    #[test]
+    fn distribute_space_does_not_round_total_headroom_below_budget() {
+        let budget = power_of_two(100);
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].growth_limit = budget;
+        tracks[1].growth_limit = 10.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            budget,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (previous_f32(power_of_two(76)), [previous_f32(budget), 10.0]));
+    }
+
+    #[test]
+    fn distribute_space_preserves_exact_weighted_endpoints() {
+        let mut tracks: [GridTrack; 2] =
+            core::array::from_fn(|_| GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO));
+        for track in &mut tracks {
+            track.growth_limit = 2.0;
+        }
+
+        let remaining_space = distribute_space_up_to_limits(
+            2.0,
+            &mut tracks,
+            |_| true,
+            |_| 10.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (0.0, [1.0, 1.0]));
+    }
+
+    #[test]
+    fn distribute_space_preserves_scale_separated_active_weight() {
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].growth_limit = 1024.0;
+        tracks[1].growth_limit = 1.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            512.0,
+            &mut tracks,
+            |_| true,
+            |track| if track.growth_limit == 1.0 { power_of_two(64) } else { 1.0 },
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (0.0, [511.0, 1.0]));
+    }
+
+    #[test]
+    fn distribute_space_projects_from_the_stable_increase_coordinate() {
+        let budget = power_of_two(77);
+        let old = power_of_two(100);
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].growth_limit = power_of_two(40);
+        tracks[1].item_incurred_increase = old;
+        tracks[1].growth_limit = f32::from_bits(old.to_bits() + 1);
+
+        let remaining_space = distribute_space_up_to_limits(
+            budget,
+            &mut tracks,
+            |_| true,
+            |track| if track.growth_limit == power_of_two(40) { power_of_two(60) } else { old },
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (previous_f32(budget), [previous_f32(power_of_two(37)), old]));
+    }
+
+    #[test]
+    fn distribute_space_groups_equal_breakpoints_independently_of_input_order() {
+        fn run(order: [usize; 4]) -> (f32, [f32; 4]) {
+            let capacities = [8.0, power_of_two(-50), power_of_two(-50), 10.0];
+            let proportions = [power_of_two(53), 1.0, 1.0, 1.0];
+            let mut tracks: [GridTrack; 4] = core::array::from_fn(|index| {
+                let mut track = GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO);
+                track.base_size = order[index] as f32;
+                track.growth_limit = capacities[order[index]];
+                track
+            });
+
+            let remaining_space = distribute_space_up_to_limits(
+                9.0,
+                &mut tracks,
+                |_| true,
+                |track| proportions[track.base_size as usize],
+                |_| 0.0,
+                |track| track.growth_limit,
+            );
+            let mut increases = [0.0; 4];
+            for track in tracks {
+                increases[track.base_size as usize] = track.item_incurred_increase;
+            }
+            (remaining_space, increases)
+        }
+
+        let expected =
+            (previous_f32(power_of_two(-24)), [8.0, power_of_two(-50), power_of_two(-50), previous_f32(1.0)]);
+        assert_eq!(run([0, 1, 2, 3]), expected);
+        assert_eq!(run([1, 2, 0, 3]), expected);
     }
 }
