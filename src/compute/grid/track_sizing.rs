@@ -1430,6 +1430,7 @@ mod tests {
     use super::*;
     use crate::prelude::TaffyZero;
     use crate::style::{MaxTrackSizingFunction, MinTrackSizingFunction};
+    use core::cell::Cell;
 
     #[test]
     fn distribute_space_accounts_for_prior_item_incurred_increase() {
@@ -1496,6 +1497,98 @@ mod tests {
         );
         let increases = tracks.map(|track| track.item_incurred_increase);
 
-        assert_eq!((remaining_space, increases), (6_302_320.5, [196_486.125, 3_501_193.5]));
+        assert_eq!((remaining_space, increases), (6_302_320.0, [196_486.125, 3_501_193.5]));
+    }
+
+    #[test]
+    fn distribute_space_never_stores_an_unbudgeted_f32_ulp() {
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].item_incurred_increase = 200_000.0;
+        tracks[0].growth_limit = 200_001.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            0.011,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (0.011, 200_000.0));
+    }
+
+    #[test]
+    fn distribute_space_projects_equal_waterline_targets_downward() {
+        let mut tracks: [GridTrack; 3] =
+            core::array::from_fn(|_| GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO));
+        for track in &mut tracks {
+            track.growth_limit = 1.0;
+        }
+
+        let remaining_space = distribute_space_up_to_limits(
+            1.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (5.960_464_5e-8, [0.333_333_3, 0.333_333_3, 0.333_333_3]));
+    }
+
+    #[test]
+    fn distribute_space_solves_scale_separated_tracks_in_one_snapshot() {
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].item_incurred_increase = 33_554_432.0;
+        tracks[0].growth_limit = 33_554_436.0;
+        tracks[1].growth_limit = 1.0;
+        let affected_calls = Cell::new(0);
+        let proportion_calls = Cell::new(0);
+        let property_calls = Cell::new(0);
+        let limit_calls = Cell::new(0);
+
+        let remaining_space = distribute_space_up_to_limits(
+            1.0,
+            &mut tracks,
+            |_| {
+                affected_calls.set(affected_calls.get() + 1);
+                true
+            },
+            |track| {
+                proportion_calls.set(proportion_calls.get() + 1);
+                if track.growth_limit == 33_554_436.0 {
+                    2_097_152.0
+                } else {
+                    1.0
+                }
+            },
+            |track| {
+                property_calls.set(property_calls.get() + 1);
+                track.base_size
+            },
+            |track| {
+                limit_calls.set(limit_calls.get() + 1);
+                track.growth_limit
+            },
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!(
+            (
+                remaining_space,
+                increases,
+                affected_calls.get(),
+                proportion_calls.get(),
+                property_calls.get(),
+                limit_calls.get(),
+            ),
+            (0.999_999_5, [33_554_432.0, 4.768_369_3e-7], 2, 2, 2, 2,)
+        );
     }
 }
