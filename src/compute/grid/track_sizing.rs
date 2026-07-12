@@ -1448,4 +1448,26 @@ mod tests {
 
         assert_eq!((remaining_space, increases), (10.0, [90.0, 20.0]));
     }
+
+    #[test]
+    fn distribute_space_does_not_regrow_frozen_tracks_within_threshold() {
+        let mut tracks: [GridTrack; 6] =
+            core::array::from_fn(|_| GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO));
+        for track in &mut tracks[..5] {
+            track.growth_limit = 1.0;
+        }
+        tracks[5].growth_limit = 1.0078125;
+
+        let remaining_space = distribute_space_up_to_limits(
+            6.03125,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (0.0234375, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0078125]));
+    }
 }
