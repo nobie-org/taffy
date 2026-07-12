@@ -1416,3 +1416,32 @@ fn distribute_space_up_to_limits(
 
     space_to_distribute
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::TaffyZero;
+    use crate::style::{MaxTrackSizingFunction, MinTrackSizingFunction};
+
+    #[test]
+    fn distribute_space_accounts_for_prior_item_incurred_increase() {
+        let mut tracks = [
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+            GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO),
+        ];
+        tracks[0].growth_limit = 90.0;
+        tracks[1].growth_limit = 20.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            120.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+        let increases = tracks.map(|track| track.item_incurred_increase);
+
+        assert_eq!((remaining_space, increases), (10.0, [90.0, 20.0]));
+    }
+}
