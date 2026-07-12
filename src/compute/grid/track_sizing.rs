@@ -1408,7 +1408,11 @@ fn distribute_space_up_to_limits(
         let iteration_item_incurred_increase =
             f32_min(min_increase_limit, space_to_distribute / track_distribution_proportion_sum);
 
-        for track in tracks.iter_mut().filter(|track| track_is_affected(track)) {
+        for track in tracks
+            .iter_mut()
+            .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
+            .filter(|track| track_is_affected(track))
+        {
             let increase = iteration_item_incurred_increase * track_distribution_proportion(track);
             let current = track_affected_property(track) + track.item_incurred_increase;
             if increase > 0.0 && current + increase <= track_limit(track) + THRESHOLD {
