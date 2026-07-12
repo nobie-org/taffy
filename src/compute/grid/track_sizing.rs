@@ -1366,6 +1366,226 @@ fn stretch_auto_tracks(
     }
 }
 
+// Every non-negative finite f32 is an integer multiple of 2^-149. Six limbs
+// hold the sum of any number of such values addressable by a 64-bit Rust slice;
+// twelve limbs hold every product used by the weighted-waterline comparisons.
+/// Number of limbs in an exact sum of non-negative f32 values.
+const EXACT_GRID_LIMBS: usize = 6;
+/// Number of limbs in a product of two exact Grid sums.
+const EXACT_GRID_PRODUCT_LIMBS: usize = EXACT_GRID_LIMBS * 2;
+
+/// A fixed-width unsigned integer whose unit is the smallest positive f32.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactGridNumber([u64; EXACT_GRID_LIMBS]);
+
+impl ExactGridNumber {
+    /// Additive identity.
+    const ZERO: Self = Self([0; EXACT_GRID_LIMBS]);
+
+    /// Convert a non-negative finite f32 to its exact integer coordinate.
+    fn from_f32(value: f32) -> Self {
+        if value == 0.0 {
+            return Self::ZERO;
+        }
+
+        debug_assert!(value.is_finite() && value > 0.0);
+        let bits = value.to_bits();
+        let encoded_exponent = (bits >> 23) & 0xff;
+        let fraction = bits & 0x7f_ffff;
+        let (significand, shift) = if encoded_exponent == 0 {
+            (fraction as u64, 0)
+        } else {
+            (((1 << 23) | fraction) as u64, (encoded_exponent - 1) as usize)
+        };
+
+        let mut words = [0; EXACT_GRID_LIMBS];
+        let word_index = shift / 64;
+        let bit_offset = shift % 64;
+        words[word_index] = significand << bit_offset;
+        if bit_offset > 40 {
+            words[word_index + 1] = significand >> (64 - bit_offset);
+        }
+        Self(words)
+    }
+
+    /// Add another exact value without losing low-order limbs.
+    fn add_assign(&mut self, rhs: Self) {
+        let mut carry = false;
+        for index in 0..EXACT_GRID_LIMBS {
+            let (sum, first_carry) = self.0[index].overflowing_add(rhs.0[index]);
+            let (sum, second_carry) = sum.overflowing_add(u64::from(carry));
+            self.0[index] = sum;
+            carry = first_carry || second_carry;
+        }
+        assert!(!carry, "exact Grid accumulator overflow");
+    }
+
+    /// Subtract another exact value, which must not exceed this one.
+    fn subtract_assign(&mut self, rhs: Self) {
+        assert!(*self >= rhs, "exact Grid accumulator underflow");
+        let mut borrow = false;
+        for index in 0..EXACT_GRID_LIMBS {
+            let (difference, first_borrow) = self.0[index].overflowing_sub(rhs.0[index]);
+            let (difference, second_borrow) = difference.overflowing_sub(u64::from(borrow));
+            self.0[index] = difference;
+            borrow = first_borrow || second_borrow;
+        }
+        debug_assert!(!borrow);
+    }
+
+    /// Return the exact non-negative difference between two values.
+    fn subtract(mut self, rhs: Self) -> Self {
+        self.subtract_assign(rhs);
+        self
+    }
+
+    /// Multiply two exact values for a rational-waterline comparison.
+    fn multiply(self, rhs: Self) -> ExactGridProduct {
+        let mut product = [0; EXACT_GRID_PRODUCT_LIMBS];
+        for left_index in 0..EXACT_GRID_LIMBS {
+            let mut carry = 0u128;
+            for right_index in 0..EXACT_GRID_LIMBS {
+                let product_index = left_index + right_index;
+                let value =
+                    product[product_index] as u128 + self.0[left_index] as u128 * rhs.0[right_index] as u128 + carry;
+                product[product_index] = value as u64;
+                carry = value >> 64;
+            }
+
+            let mut product_index = left_index + EXACT_GRID_LIMBS;
+            while carry != 0 {
+                assert!(product_index < EXACT_GRID_PRODUCT_LIMBS, "exact Grid product overflow");
+                let value = product[product_index] as u128 + carry;
+                product[product_index] = value as u64;
+                carry = value >> 64;
+                product_index += 1;
+            }
+        }
+        ExactGridProduct(product)
+    }
+
+    /// Return the greatest f32 no larger than this exact value.
+    fn floor_f32(self, upper_bound: f32) -> f32 {
+        let mut lower_bits = 0;
+        let mut upper_bits = upper_bound.to_bits();
+        while lower_bits < upper_bits {
+            let midpoint = lower_bits + (upper_bits - lower_bits) / 2 + (upper_bits - lower_bits) % 2;
+            if Self::from_f32(f32::from_bits(midpoint)) <= self {
+                lower_bits = midpoint;
+            } else {
+                upper_bits = midpoint - 1;
+            }
+        }
+        f32::from_bits(lower_bits)
+    }
+}
+
+impl Ord for ExactGridNumber {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for index in (0..EXACT_GRID_LIMBS).rev() {
+            match self.0[index].cmp(&other.0[index]) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl PartialOrd for ExactGridNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Full-width product of two exact Grid values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactGridProduct([u64; EXACT_GRID_PRODUCT_LIMBS]);
+
+impl Ord for ExactGridProduct {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for index in (0..EXACT_GRID_PRODUCT_LIMBS).rev() {
+            match self.0[index].cmp(&other.0[index]) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl PartialOrd for ExactGridProduct {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One immutable input to the exact capped-waterline solve.
+struct ExactGridGrowthEvent {
+    /// Original track slot to update after sorting events.
+    track_index: usize,
+    /// Previously stored item-incurred increase.
+    old_increase: f32,
+    /// Finite f32 ceiling for the endpoint lattice search.
+    endpoint_upper_bound: f32,
+    /// Exact finite headroom, or `None` for positive-infinite capacity.
+    headroom: Option<ExactGridNumber>,
+    /// Exact positive finite distribution proportion.
+    proportion: ExactGridNumber,
+}
+
+/// Compare exact cap waterlines without dividing their dyadic inputs.
+fn compare_exact_grid_breakpoints(a: &ExactGridGrowthEvent, b: &ExactGridGrowthEvent) -> Ordering {
+    match (a.headroom, b.headroom) {
+        (Some(a_headroom), Some(b_headroom)) => {
+            a_headroom.multiply(b.proportion).cmp(&b_headroom.multiply(a.proportion))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Order events by exact breakpoint and then by a value-deterministic tie key.
+fn compare_exact_grid_events(a: &ExactGridGrowthEvent, b: &ExactGridGrowthEvent) -> Ordering {
+    compare_exact_grid_breakpoints(a, b)
+        .then_with(|| a.headroom.cmp(&b.headroom))
+        .then_with(|| a.old_increase.total_cmp(&b.old_increase))
+        .then_with(|| a.proportion.cmp(&b.proportion))
+        .then_with(|| a.endpoint_upper_bound.total_cmp(&b.endpoint_upper_bound))
+        .then_with(|| a.track_index.cmp(&b.track_index))
+}
+
+/// Select one greatest endpoint under its exact cap and optional active waterline.
+fn select_exact_grid_endpoint(
+    event: &ExactGridGrowthEvent,
+    active_constraint: Option<(ExactGridNumber, ExactGridProduct)>,
+) -> f32 {
+    let mut lower_bits = event.old_increase.to_bits();
+    let mut upper_bits = event.endpoint_upper_bound.to_bits();
+    while lower_bits < upper_bits {
+        let midpoint = lower_bits + (upper_bits - lower_bits) / 2 + (upper_bits - lower_bits) % 2;
+        let candidate = f32::from_bits(midpoint);
+        let candidate_increase =
+            ExactGridNumber::from_f32(candidate).subtract(ExactGridNumber::from_f32(event.old_increase));
+        let is_within_capacity = match event.headroom {
+            Some(headroom) => candidate_increase <= headroom,
+            None => true,
+        };
+        let is_within_waterline = match active_constraint {
+            Some((proportion, affordable)) => candidate_increase.multiply(proportion) <= affordable,
+            None => true,
+        };
+
+        if is_within_capacity && is_within_waterline {
+            lower_bits = midpoint;
+        } else {
+            upper_bits = midpoint - 1;
+        }
+    }
+    f32::from_bits(lower_bits)
+}
+
 /// Helper function for distributing space to tracks evenly
 /// Used by both distribute_item_space_to_base_size and maximise_tracks steps
 #[inline(always)]
@@ -1377,52 +1597,122 @@ fn distribute_space_up_to_limits(
     track_affected_property: impl Fn(&GridTrack) -> f32,
     track_limit: impl Fn(&GridTrack) -> f32,
 ) -> f32 {
-    /// Define a small constant to avoid infinite loops due to rounding errors. Rather than stopping distributing
-    /// extra space when it gets to exactly zero, we will stop when it falls below this amount
-    const THRESHOLD: f32 = 0.01;
+    if !space_to_distribute.is_finite() || space_to_distribute <= 0.0 {
+        return space_to_distribute;
+    }
 
-    let mut space_to_distribute = space_to_distribute;
-    while space_to_distribute > THRESHOLD {
-        let track_distribution_proportion_sum: f32 = tracks
-            .iter()
-            .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
-            .filter(|track| track_is_affected(track))
-            .map(&track_distribution_proportion)
-            .sum();
+    // Snapshot each input exactly once. Non-finite proportions have no finite
+    // weighted-waterline meaning and therefore do not enter the active set.
+    let mut events = Vec::with_capacity(tracks.len());
+    for (track_index, track) in tracks.iter().enumerate() {
+        let is_affected = track_is_affected(track);
+        let proportion_value = track_distribution_proportion(track);
+        let affected_property = track_affected_property(track);
+        let limit = track_limit(track);
+        let old_increase = if track.item_incurred_increase == 0.0 { 0.0 } else { track.item_incurred_increase };
 
-        if track_distribution_proportion_sum == 0.0 {
-            break;
-        }
-
-        // Compute item-incurred increase for this iteration
-        let min_increase_limit = tracks
-            .iter()
-            .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
-            .filter(|track| track_is_affected(track))
-            .map(|track| {
-                let current = track_affected_property(track) + track.item_incurred_increase;
-                (track_limit(track) - current) / track_distribution_proportion(track)
-            })
-            .min_by(|a, b| a.total_cmp(b))
-            .unwrap(); // We will never pass an empty track list to this function
-        let iteration_item_incurred_increase =
-            f32_min(min_increase_limit, space_to_distribute / track_distribution_proportion_sum);
-
-        for track in tracks
-            .iter_mut()
-            .filter(|track| track_affected_property(track) + track.item_incurred_increase < track_limit(track))
-            .filter(|track| track_is_affected(track))
+        if is_affected
+            && proportion_value.is_finite()
+            && proportion_value > 0.0
+            && old_increase.is_finite()
+            && old_increase >= 0.0
         {
-            let increase = iteration_item_incurred_increase * track_distribution_proportion(track);
-            let current = track_affected_property(track) + track.item_incurred_increase;
-            if increase > 0.0 && current + increase <= track_limit(track) + THRESHOLD {
-                track.item_incurred_increase += increase;
-                space_to_distribute -= increase;
-            }
+            let old_exact = ExactGridNumber::from_f32(old_increase);
+            let (endpoint_upper_bound, headroom) =
+                if limit == f32::INFINITY && affected_property.is_finite() && affected_property >= 0.0 {
+                    (f32::MAX, None)
+                } else if limit.is_finite() && limit >= 0.0 && affected_property.is_finite() && affected_property >= 0.0
+                {
+                    let limit_exact = ExactGridNumber::from_f32(limit);
+                    let affected_property_exact = ExactGridNumber::from_f32(affected_property);
+                    if affected_property_exact > limit_exact {
+                        continue;
+                    }
+                    let capacity_exact = limit_exact.subtract(affected_property_exact);
+                    if old_exact >= capacity_exact {
+                        continue;
+                    }
+                    (limit, Some(capacity_exact.subtract(old_exact)))
+                } else {
+                    continue;
+                };
+            events.push(ExactGridGrowthEvent {
+                track_index,
+                old_increase,
+                endpoint_upper_bound,
+                headroom,
+                proportion: ExactGridNumber::from_f32(proportion_value),
+            });
         }
     }
 
-    space_to_distribute
+    if events.is_empty() {
+        return space_to_distribute;
+    }
+
+    events.sort_unstable_by(compare_exact_grid_events);
+
+    let budget = ExactGridNumber::from_f32(space_to_distribute);
+    let mut frozen_headroom = ExactGridNumber::ZERO;
+    let mut active_proportion = ExactGridNumber::ZERO;
+    for event in &events {
+        active_proportion.add_assign(event.proportion);
+    }
+
+    // Retire each exact breakpoint group only when the exact budget reaches it.
+    let mut first_active_index = events.len();
+    let mut group_start = 0;
+    while group_start < events.len() {
+        let mut group_end = group_start + 1;
+        while group_end < events.len()
+            && compare_exact_grid_breakpoints(&events[group_start], &events[group_end]) == Ordering::Equal
+        {
+            group_end += 1;
+        }
+
+        let can_freeze_group = match events[group_start].headroom {
+            Some(group_headroom) => {
+                let remaining_budget = budget.subtract(frozen_headroom);
+                remaining_budget.multiply(events[group_start].proportion) >= group_headroom.multiply(active_proportion)
+            }
+            None => false,
+        };
+
+        if !can_freeze_group {
+            first_active_index = group_start;
+            break;
+        }
+
+        for event in &events[group_start..group_end] {
+            frozen_headroom.add_assign(event.headroom.expect("an infinite breakpoint cannot freeze"));
+            active_proportion.subtract_assign(event.proportion);
+        }
+        group_start = group_end;
+    }
+
+    // Frozen groups have reached their exact capacities. Select every remaining
+    // endpoint once on the monotone f32 lattice under the exact rational waterline.
+    for event in &events[..first_active_index] {
+        tracks[event.track_index].item_incurred_increase = select_exact_grid_endpoint(event, None);
+    }
+    if first_active_index < events.len() {
+        let remaining_budget = budget.subtract(frozen_headroom);
+        for event in &events[first_active_index..] {
+            let affordable_weighted_increase = remaining_budget.multiply(event.proportion);
+            tracks[event.track_index].item_incurred_increase =
+                select_exact_grid_endpoint(event, Some((active_proportion, affordable_weighted_increase)));
+        }
+    }
+
+    let mut used_space = ExactGridNumber::ZERO;
+    for event in &events {
+        let next_increase = tracks[event.track_index].item_incurred_increase;
+        used_space.add_assign(
+            ExactGridNumber::from_f32(next_increase).subtract(ExactGridNumber::from_f32(event.old_increase)),
+        );
+    }
+    assert!(used_space <= budget, "exact Grid waterline exceeded its budget");
+    budget.subtract(used_space).floor_f32(space_to_distribute)
 }
 
 #[cfg(test)]
@@ -1722,5 +2012,96 @@ mod tests {
             (previous_f32(power_of_two(-24)), [8.0, power_of_two(-50), power_of_two(-50), previous_f32(1.0)]);
         assert_eq!(run([0, 1, 2, 3]), expected);
         assert_eq!(run([1, 2, 0, 3]), expected);
+    }
+
+    #[test]
+    fn distribute_space_canonicalizes_negative_zero_increase() {
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].item_incurred_increase = -0.0;
+        tracks[0].growth_limit = 2.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            1.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (0.0, 1.0));
+    }
+
+    #[test]
+    fn distribute_space_projects_exact_capacity_down_to_the_limit() {
+        let limit = f32::from_bits(0x74c1_0a47);
+        let affected_property = f32::from_bits(0x73f8_774e);
+        let rounded_up_capacity = f32::from_bits(0x7482_ec74);
+        let expected_capacity = f32::from_bits(0x7482_ec73);
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].base_size = affected_property;
+        tracks[0].growth_limit = limit;
+
+        let remaining_space = distribute_space_up_to_limits(
+            rounded_up_capacity,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (power_of_two(83), expected_capacity));
+    }
+
+    #[test]
+    fn distribute_space_grows_an_unbounded_track_under_a_finite_budget() {
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].growth_limit = f32::INFINITY;
+
+        let remaining_space = distribute_space_up_to_limits(
+            1.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (0.0, 1.0));
+    }
+
+    #[test]
+    fn distribute_space_excludes_a_nonfinite_proportion() {
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].growth_limit = 1.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            0.5,
+            &mut tracks,
+            |_| true,
+            |_| f32::INFINITY,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (0.5, 0.0));
+    }
+
+    #[test]
+    fn distribute_space_leaves_a_nonpositive_budget_unchanged() {
+        let mut tracks = [GridTrack::new(MinTrackSizingFunction::ZERO, MaxTrackSizingFunction::ZERO)];
+        tracks[0].growth_limit = 1.0;
+
+        let remaining_space = distribute_space_up_to_limits(
+            -1.0,
+            &mut tracks,
+            |_| true,
+            |_| 1.0,
+            |track| track.base_size,
+            |track| track.growth_limit,
+        );
+
+        assert_eq!((remaining_space, tracks[0].item_incurred_increase), (-1.0, 0.0));
     }
 }
