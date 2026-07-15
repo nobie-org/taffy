@@ -112,15 +112,22 @@ impl Cache {
         let known_dimensions = input.known_dimensions;
         let available_space = input.available_space;
 
+        // A cached entry may only answer a query with the same known_dimensions
+        // (and, for axes with no known dimension, equivalent available space).
+        // A query must NEVER be matched against the cached entry's RESULT size:
+        // when a min/max size constraint clamps the reported size away from the
+        // size the content was actually laid out at, the pair (reported size,
+        // content geometry) is inconsistent — e.g. a max-width-clamped column of
+        // wrapping text reports the clamped width with the height of the
+        // UNCLAMPED single-line layout. Matching `known_dimensions == cached
+        // result size` then reuses that stale height for the very query
+        // (layout at the clamped width) that would have re-wrapped the text.
         match input.run_mode {
             RunMode::PerformLayout => self
                 .final_layout_entry
                 .filter(|entry| {
-                    let cached_size = entry.content.size;
-                    (known_dimensions.width == entry.known_dimensions.width
-                        || known_dimensions.width == Some(cached_size.width))
-                        && (known_dimensions.height == entry.known_dimensions.height
-                            || known_dimensions.height == Some(cached_size.height))
+                    known_dimensions.width == entry.known_dimensions.width
+                        && known_dimensions.height == entry.known_dimensions.height
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
@@ -131,10 +138,8 @@ impl Cache {
                 for entry in self.measure_entries.iter().flatten() {
                     let cached_size = entry.content;
 
-                    if (known_dimensions.width == entry.known_dimensions.width
-                        || known_dimensions.width == Some(cached_size.width))
-                        && (known_dimensions.height == entry.known_dimensions.height
-                            || known_dimensions.height == Some(cached_size.height))
+                    if known_dimensions.width == entry.known_dimensions.width
+                        && known_dimensions.height == entry.known_dimensions.height
                         && (known_dimensions.width.is_some()
                             || entry.available_space.width.is_roughly_equal(available_space.width))
                         && (known_dimensions.height.is_some()
